@@ -288,16 +288,21 @@ impl NetworkNode {
                     debug!("Sync response from {}: {:?}", peer, response);
                 }
             },
-            MiniChainBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. }) => {
+            MiniChainBehaviourEvent::Identify(identify::Event::Received {
+                peer_id, info, ..
+            }) => {
                 // When we receive identify info from a peer, learn about their listen addresses
-                info!("Identify received from {}: {:?}", peer_id, info.listen_addrs);
-                
+                info!(
+                    "Identify received from {}: {:?}",
+                    peer_id, info.listen_addrs
+                );
+
                 // Add to gossipsub mesh
                 self.swarm
                     .behaviour_mut()
                     .gossipsub
                     .add_explicit_peer(&peer_id);
-                
+
                 // Also connect to other peers they know about through their observed addr
                 // This helps with peer discovery in small networks
                 for addr in info.listen_addrs {

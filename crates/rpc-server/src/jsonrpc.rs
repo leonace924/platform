@@ -1154,19 +1154,34 @@ impl RpcHandler {
         // Get the signed message bytes (hex-encoded)
         let message_hex = match self.get_param_str(&params, 0, "signedMessage") {
             Some(m) => m,
-            None => return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing 'signedMessage' parameter (hex-encoded)"),
+            None => {
+                return JsonRpcResponse::error(
+                    id,
+                    INVALID_PARAMS,
+                    "Missing 'signedMessage' parameter (hex-encoded)",
+                )
+            }
         };
 
         // Decode hex to bytes
         let message_bytes = match hex::decode(&message_hex) {
             Ok(b) => b,
-            Err(e) => return JsonRpcResponse::error(id, INVALID_PARAMS, format!("Invalid hex: {}", e)),
+            Err(e) => {
+                return JsonRpcResponse::error(id, INVALID_PARAMS, format!("Invalid hex: {}", e))
+            }
         };
 
         // Verify it's a valid SignedNetworkMessage
-        let signed: platform_core::SignedNetworkMessage = match bincode::deserialize(&message_bytes) {
+        let signed: platform_core::SignedNetworkMessage = match bincode::deserialize(&message_bytes)
+        {
             Ok(s) => s,
-            Err(e) => return JsonRpcResponse::error(id, INVALID_PARAMS, format!("Invalid message format: {}", e)),
+            Err(e) => {
+                return JsonRpcResponse::error(
+                    id,
+                    INVALID_PARAMS,
+                    format!("Invalid message format: {}", e),
+                )
+            }
         };
 
         // Verify signature
@@ -1181,19 +1196,38 @@ impl RpcHandler {
         };
 
         if !is_sudo {
-            info!("Sudo check failed: signer={} chain_sudo={}", signed.signer().to_hex(), chain_sudo_key);
-            return JsonRpcResponse::error(id, INVALID_PARAMS, 
-                format!("Signer {} is not the sudo key {}", signed.signer().to_hex(), chain_sudo_key));
+            info!(
+                "Sudo check failed: signer={} chain_sudo={}",
+                signed.signer().to_hex(),
+                chain_sudo_key
+            );
+            return JsonRpcResponse::error(
+                id,
+                INVALID_PARAMS,
+                format!(
+                    "Signer {} is not the sudo key {}",
+                    signed.signer().to_hex(),
+                    chain_sudo_key
+                ),
+            );
         }
 
         // Also apply locally since gossipsub doesn't echo back to sender
         // Check if this is a Proposal containing SudoAction::AddChallenge
         if let platform_core::NetworkMessage::Proposal(ref proposal) = signed.message {
-            if let platform_core::ProposalAction::Sudo(platform_core::SudoAction::AddChallenge { config }) = &proposal.action {
+            if let platform_core::ProposalAction::Sudo(platform_core::SudoAction::AddChallenge {
+                config,
+            }) = &proposal.action
+            {
                 // Apply locally
                 let mut chain = self.chain_state.write();
-                chain.challenge_configs.insert(config.challenge_id, config.clone());
-                info!("Applied AddChallenge locally: {} ({})", config.name, config.challenge_id);
+                chain
+                    .challenge_configs
+                    .insert(config.challenge_id, config.clone());
+                info!(
+                    "Applied AddChallenge locally: {} ({})",
+                    config.name, config.challenge_id
+                );
 
                 // Also register routes
                 drop(chain);
@@ -1215,12 +1249,23 @@ impl RpcHandler {
         match tx.as_ref() {
             Some(sender) => {
                 if let Err(e) = sender.send(message_bytes.clone()) {
-                    return JsonRpcResponse::error(id, INTERNAL_ERROR, format!("Failed to queue broadcast: {}", e));
+                    return JsonRpcResponse::error(
+                        id,
+                        INTERNAL_ERROR,
+                        format!("Failed to queue broadcast: {}", e),
+                    );
                 }
-                info!("Sudo action queued for P2P broadcast from {}", signed.signer());
+                info!(
+                    "Sudo action queued for P2P broadcast from {}",
+                    signed.signer()
+                );
             }
             None => {
-                return JsonRpcResponse::error(id, INTERNAL_ERROR, "Broadcast channel not configured");
+                return JsonRpcResponse::error(
+                    id,
+                    INTERNAL_ERROR,
+                    "Broadcast channel not configured",
+                );
             }
         }
 
@@ -1248,11 +1293,18 @@ impl RpcHandler {
 
         let docker_image = match self.get_param_str(&params, 1, "dockerImage") {
             Some(i) => i,
-            None => return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing 'dockerImage' parameter"),
+            None => {
+                return JsonRpcResponse::error(
+                    id,
+                    INVALID_PARAMS,
+                    "Missing 'dockerImage' parameter",
+                )
+            }
         };
 
         let mechanism_id = self.get_param_u64(&params, 2, "mechanismId").unwrap_or(1) as u8;
-        let emission_weight = params.get("emissionWeight")
+        let emission_weight = params
+            .get("emissionWeight")
             .and_then(|v| v.as_f64())
             .unwrap_or(1.0);
 
@@ -1289,7 +1341,10 @@ impl RpcHandler {
             ChallengeRoute::get("/health", "Health check"),
         ];
         self.register_challenge_routes(&name, routes);
-        info!("DEV: Registered routes for challenge '{}' at /challenge/{}/", name, name);
+        info!(
+            "DEV: Registered routes for challenge '{}' at /challenge/{}/",
+            name, name
+        );
 
         JsonRpcResponse::result(
             id,

@@ -4,7 +4,6 @@
 
 use anyhow::Result;
 use challenge_orchestrator::{ChallengeOrchestrator, OrchestratorConfig};
-use std::collections::HashMap;
 use clap::Parser;
 use distributed_db::{ConsensusStatus, DBSyncEvent, DBSyncManager, DBSyncMessage, DistributedDB};
 use parking_lot::RwLock;
@@ -26,6 +25,7 @@ use platform_network::{
 use platform_rpc::{RpcConfig, RpcServer};
 use platform_storage::Storage;
 use platform_subnet_manager::BanList;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -342,7 +342,7 @@ async fn main() -> Result<()> {
     // Start RPC server (if enabled)
     // Challenge-specific logic is handled by Docker containers
     // The validator only proxies requests to challenges via HTTP
-    let (_rpc_handle, rpc_handler, mut rpc_broadcast_rx) = if args.rpc_port > 0 {
+    let (_rpc_handle, rpc_handler, rpc_broadcast_rx) = if args.rpc_port > 0 {
         let rpc_addr = format!("{}:{}", args.rpc_addr, args.rpc_port);
         let rpc_config = RpcConfig {
             addr: rpc_addr.parse()?,
@@ -382,9 +382,9 @@ async fn main() -> Result<()> {
         let endpoints_for_handler = challenge_endpoints.clone();
         let chain_state_for_handler = chain_state.clone();
         let keypair_for_handler = keypair.clone();
-        
+
         // Create shared channel for P2P agent submission broadcasts
-        let agent_broadcast_tx: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>> = 
+        let agent_broadcast_tx: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>> =
             Arc::new(RwLock::new(None));
         let agent_broadcast_for_handler = agent_broadcast_tx.clone();
 
@@ -406,9 +406,10 @@ async fn main() -> Result<()> {
                         // Try to derive from challenge_configs (for dynamically added challenges)
                         drop(eps);
                         let state = chain_state.read();
-                        let config = state.challenge_configs.values()
-                            .find(|c| c.challenge_id.to_string() == challenge_id || c.name == challenge_id);
-                        
+                        let config = state.challenge_configs.values().find(|c| {
+                            c.challenge_id.to_string() == challenge_id || c.name == challenge_id
+                        });
+
                         match config {
                             Some(cfg) => {
                                 let container_name = cfg.name.to_lowercase().replace(' ', "-");
@@ -446,28 +447,48 @@ async fn main() -> Result<()> {
                             Ok(body) => {
                                 if status.is_success() {
                                     // Broadcast successful submissions via P2P
-                                    if req.path == "/submit" && body.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                        if let Some(agent_hash) = body.get("agent_hash").and_then(|v| v.as_str()) {
+                                    if req.path == "/submit"
+                                        && body
+                                            .get("success")
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(false)
+                                    {
+                                        if let Some(agent_hash) =
+                                            body.get("agent_hash").and_then(|v| v.as_str())
+                                        {
                                             // Extract submission details from request body
-                                            let miner_hotkey = req.body.get("miner_hotkey")
+                                            let miner_hotkey = req
+                                                .body
+                                                .get("miner_hotkey")
                                                 .and_then(|v| v.as_str())
                                                 .unwrap_or("unknown")
                                                 .to_string();
-                                            let source_code = req.body.get("source_code")
+                                            let source_code = req
+                                                .body
+                                                .get("source_code")
                                                 .and_then(|v| v.as_str())
                                                 .map(String::from);
-                                            
+
                                             // Create AgentSubmission message
-                                            let submission_msg = platform_core::AgentSubmissionMessage::new(
-                                                challenge_id.clone(),
-                                                agent_hash.to_string(),
-                                                miner_hotkey.clone(),
-                                                source_code,
-                                                keypair.hotkey(),
-                                            );
-                                            
-                                            let network_msg = platform_core::NetworkMessage::AgentSubmission(submission_msg);
-                                            if let Ok(signed) = platform_core::SignedNetworkMessage::new(network_msg, &keypair) {
+                                            let submission_msg =
+                                                platform_core::AgentSubmissionMessage::new(
+                                                    challenge_id.clone(),
+                                                    agent_hash.to_string(),
+                                                    miner_hotkey.clone(),
+                                                    source_code,
+                                                    keypair.hotkey(),
+                                                );
+
+                                            let network_msg =
+                                                platform_core::NetworkMessage::AgentSubmission(
+                                                    submission_msg,
+                                                );
+                                            if let Ok(signed) =
+                                                platform_core::SignedNetworkMessage::new(
+                                                    network_msg,
+                                                    &keypair,
+                                                )
+                                            {
                                                 if let Ok(bytes) = bincode::serialize(&signed) {
                                                     let tx = broadcast_tx.read();
                                                     if let Some(sender) = tx.as_ref() {
@@ -480,28 +501,38 @@ async fn main() -> Result<()> {
                                                     }
                                                 }
                                             }
-                                            
+
                                             // Submitting validator also signs consensus
                                             let agent_h = agent_hash.to_string();
                                             let validator_h = keypair.hotkey().to_hex();
-                                            let container = challenge_id.to_lowercase().replace(' ', "-");
-                                            let obfuscated = body.get("status")
+                                            let container =
+                                                challenge_id.to_lowercase().replace(' ', "-");
+                                            let obfuscated = body
+                                                .get("status")
                                                 .and_then(|s| s.get("distribution_status"))
                                                 .and_then(|d| d.get("obfuscated_hash"))
                                                 .and_then(|v| v.as_str())
                                                 .unwrap_or(&agent_h)
                                                 .to_string();
-                                            
+
                                             tokio::spawn(async move {
                                                 let client = reqwest::Client::new();
-                                                let sign_url = format!("http://challenge-{}:8080/consensus/sign", container);
+                                                let sign_url = format!(
+                                                    "http://challenge-{}:8080/consensus/sign",
+                                                    container
+                                                );
                                                 let payload = serde_json::json!({
                                                     "agent_hash": agent_h,
                                                     "validator_hotkey": validator_h,
                                                     "obfuscated_hash": obfuscated,
                                                     "signature": "0000000000000000000000000000000000000000000000000000000000000000"
                                                 });
-                                                if let Ok(resp) = client.post(&sign_url).json(&payload).send().await {
+                                                if let Ok(resp) = client
+                                                    .post(&sign_url)
+                                                    .json(&payload)
+                                                    .send()
+                                                    .await
+                                                {
                                                     if resp.status().is_success() {
                                                         tracing::info!("Submitting validator signed consensus for agent {}", agent_h);
                                                     }
@@ -552,15 +583,20 @@ async fn main() -> Result<()> {
 
         // Keep reference to RPC handler for peer updates and broadcast channel
         let rpc_handler = rpc_server.rpc_handler();
-        
+
         // Create channel for RPC -> P2P broadcast (for sudo_submit and agent submissions)
-        let (rpc_broadcast_tx, rpc_broadcast_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (rpc_broadcast_tx, rpc_broadcast_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         rpc_handler.set_broadcast_tx(rpc_broadcast_tx.clone());
-        
+
         // Also set the agent broadcast channel (used by route handler for /submit)
         *agent_broadcast_tx.write() = Some(rpc_broadcast_tx);
-        
-        (Some(rpc_server.spawn()), Some(rpc_handler), Some(rpc_broadcast_rx))
+
+        (
+            Some(rpc_server.spawn()),
+            Some(rpc_handler),
+            Some(rpc_broadcast_rx),
+        )
     } else {
         info!("RPC server disabled (--rpc-port 0)");
         (None, None, None)
@@ -669,7 +705,11 @@ async fn main() -> Result<()> {
     let (msg_tx, mut msg_rx) = mpsc::channel::<SignedNetworkMessage>(1000);
 
     // Create consensus engine (wrapped in Arc for sharing)
-    let consensus = Arc::new(PBFTEngine::new(keypair.clone(), chain_state.clone(), msg_tx));
+    let consensus = Arc::new(PBFTEngine::new(
+        keypair.clone(),
+        chain_state.clone(),
+        msg_tx,
+    ));
     consensus.sync_validators();
 
     // Parse bootstrap peers
@@ -734,8 +774,14 @@ async fn main() -> Result<()> {
         let net_cmd_tx_for_rpc = net_cmd_tx.clone();
         tokio::spawn(async move {
             while let Some(data) = rx.recv().await {
-                info!("Forwarding RPC broadcast ({} bytes) to P2P network", data.len());
-                if let Err(e) = net_cmd_tx_for_rpc.send(NetworkCommand::BroadcastRaw(data)).await {
+                info!(
+                    "Forwarding RPC broadcast ({} bytes) to P2P network",
+                    data.len()
+                );
+                if let Err(e) = net_cmd_tx_for_rpc
+                    .send(NetworkCommand::BroadcastRaw(data))
+                    .await
+                {
                     error!("Failed to forward RPC broadcast: {}", e);
                 }
             }
@@ -1413,7 +1459,7 @@ async fn main() -> Result<()> {
 /// Commands to send to the network task
 enum NetworkCommand {
     Broadcast(SignedNetworkMessage),
-    BroadcastRaw(Vec<u8>),  // For RPC sudo_submit - already serialized
+    BroadcastRaw(Vec<u8>), // For RPC sudo_submit - already serialized
     SendResponse(platform_network::ResponseChannelWrapper, SyncResponse),
 }
 
@@ -1422,7 +1468,9 @@ async fn handle_message(
     msg: SignedNetworkMessage,
     chain_state: &Arc<RwLock<ChainState>>,
     challenge_orchestrator: Option<&Arc<ChallengeOrchestrator>>,
-    challenge_routes: Option<&Arc<RwLock<HashMap<String, Vec<platform_challenge_sdk::ChallengeRoute>>>>>,
+    challenge_routes: Option<
+        &Arc<RwLock<HashMap<String, Vec<platform_challenge_sdk::ChallengeRoute>>>>,
+    >,
     distributed_db: Option<&Arc<distributed_db::DistributedDB>>,
 ) {
     let signer = msg.signer().clone();
@@ -1479,7 +1527,9 @@ async fn handle_message(
                             ChallengeRoute::get("/stats", "Get statistics"),
                             ChallengeRoute::get("/health", "Health check"),
                         ];
-                        routes_map.write().insert(config.name.clone(), default_routes);
+                        routes_map
+                            .write()
+                            .insert(config.name.clone(), default_routes);
                         info!("Auto-registered routes for challenge '{}'", config.name);
                     }
                 }
@@ -1547,7 +1597,10 @@ async fn handle_message(
         }
         NetworkMessage::Proposal(proposal) => {
             // Check if this is a Sudo AddChallenge proposal and auto-register routes
-            if let platform_core::ProposalAction::Sudo(platform_core::SudoAction::AddChallenge { ref config }) = proposal.action {
+            if let platform_core::ProposalAction::Sudo(platform_core::SudoAction::AddChallenge {
+                ref config,
+            }) = proposal.action
+            {
                 if let Some(routes_map) = challenge_routes {
                     use platform_challenge_sdk::ChallengeRoute;
                     let default_routes = vec![
@@ -1558,11 +1611,16 @@ async fn handle_message(
                         ChallengeRoute::get("/stats", "Get statistics"),
                         ChallengeRoute::get("/health", "Health check"),
                     ];
-                    routes_map.write().insert(config.name.clone(), default_routes);
-                    info!("Auto-registered routes for challenge '{}' (from P2P Proposal)", config.name);
+                    routes_map
+                        .write()
+                        .insert(config.name.clone(), default_routes);
+                    info!(
+                        "Auto-registered routes for challenge '{}' (from P2P Proposal)",
+                        config.name
+                    );
                 }
             }
-            
+
             if let Err(e) = consensus.handle_proposal(proposal, &signer).await {
                 error!("Failed to handle proposal: {}", e);
             }
@@ -1618,29 +1676,34 @@ async fn handle_message(
                 &submission.agent_hash[..16.min(submission.agent_hash.len())],
                 submission.miner_hotkey
             );
-            
+
             // Verify we have this challenge configured
             let challenge_id_opt = {
                 let state = chain_state.read();
-                state.challenge_configs.values()
+                state
+                    .challenge_configs
+                    .values()
                     .find(|c| c.name == submission.challenge_id)
                     .map(|c| c.challenge_id)
             };
-            
+
             let challenge_id = match challenge_id_opt {
                 Some(id) => id,
                 None => {
-                    warn!("Received agent for unknown challenge: {}", submission.challenge_id);
+                    warn!(
+                        "Received agent for unknown challenge: {}",
+                        submission.challenge_id
+                    );
                     return;
                 }
             };
-            
+
             // For Docker challenges, sign consensus and forward to challenge container
             let challenge_config = {
                 let state = chain_state.read();
                 state.challenge_configs.get(&challenge_id).cloned()
             };
-            
+
             if let Some(config) = challenge_config {
                 let container_name = config.name.to_lowercase().replace(' ', "-");
                 let agent_hash = submission.agent_hash.clone();
@@ -1649,19 +1712,20 @@ async fn handle_message(
                 let miner = submission.miner_hotkey.clone();
                 let obfuscated_hash = submission.obfuscated_hash.clone().unwrap_or_else(|| {
                     // Generate obfuscated hash from agent hash if not provided
-                    use sha2::{Sha256, Digest};
+                    use sha2::{Digest, Sha256};
                     let mut hasher = Sha256::new();
                     hasher.update(agent_hash.as_bytes());
                     hasher.update(b"obfuscated");
                     hex::encode(hasher.finalize())
                 });
                 let validator_hotkey = signer.to_hex();
-                
+
                 // Sign consensus for this agent (allows evaluation to proceed)
                 tokio::spawn(async move {
                     let client = reqwest::Client::new();
-                    let consensus_endpoint = format!("http://challenge-{}:8080/consensus/sign", container_name);
-                    
+                    let consensus_endpoint =
+                        format!("http://challenge-{}:8080/consensus/sign", container_name);
+
                     // Sign the consensus
                     let sign_payload = serde_json::json!({
                         "agent_hash": agent_hash,
@@ -1669,12 +1733,18 @@ async fn handle_message(
                         "obfuscated_hash": obfuscated_hash,
                         "signature": "0000000000000000000000000000000000000000000000000000000000000000"
                     });
-                    
-                    match client.post(&consensus_endpoint).json(&sign_payload).send().await {
+
+                    match client
+                        .post(&consensus_endpoint)
+                        .json(&sign_payload)
+                        .send()
+                        .await
+                    {
                         Ok(resp) => {
                             if resp.status().is_success() {
                                 if let Ok(result) = resp.json::<serde_json::Value>().await {
-                                    let consensus_reached = result.get("consensus_reached")
+                                    let consensus_reached = result
+                                        .get("consensus_reached")
                                         .and_then(|v| v.as_bool())
                                         .unwrap_or(false);
                                     info!(
@@ -1692,12 +1762,15 @@ async fn handle_message(
                             }
                         }
                         Err(e) => {
-                            debug!("Failed to sign consensus for agent {}: {}", 
-                                &agent_hash[..16.min(agent_hash.len())], e);
+                            debug!(
+                                "Failed to sign consensus for agent {}: {}",
+                                &agent_hash[..16.min(agent_hash.len())],
+                                e
+                            );
                         }
                     }
                 });
-                
+
                 info!(
                     "Agent {} received via P2P (challenge: {}, miner: {})",
                     &agent_hash_for_log[..16.min(agent_hash_for_log.len())],
@@ -1705,7 +1778,10 @@ async fn handle_message(
                     miner
                 );
             } else {
-                warn!("Challenge config not found for: {}", submission.challenge_id);
+                warn!(
+                    "Challenge config not found for: {}",
+                    submission.challenge_id
+                );
             }
         }
         NetworkMessage::EvaluationResult(result) => {
@@ -1715,14 +1791,18 @@ async fn handle_message(
                 &result.agent_hash[..16.min(result.agent_hash.len())],
                 result.score.value
             );
-            
+
             // Store in distributed DB for aggregation and verification
             if let Some(db) = distributed_db {
                 use distributed_db::StoredEvaluation;
-                
+
                 // Create stored evaluation from P2P message
                 let stored_eval = StoredEvaluation {
-                    id: format!("{}_{}", result.job_id, result.validator.to_hex()[..16].to_string()),
+                    id: format!(
+                        "{}_{}",
+                        result.job_id,
+                        result.validator.to_hex()[..16].to_string()
+                    ),
                     agent_hash: result.agent_hash.clone(),
                     challenge_id: result.challenge_id.to_string(),
                     validator: result.validator.to_hex(),
@@ -1734,7 +1814,7 @@ async fn handle_message(
                     evaluated_at: result.timestamp.timestamp() as u64,
                     block_number: 0, // Current block will be set by DB
                 };
-                
+
                 // Store in distributed DB
                 if let Err(e) = db.store_evaluation(&stored_eval) {
                     error!("Failed to store evaluation result in DB: {}", e);
@@ -1747,11 +1827,10 @@ async fn handle_message(
                     );
                 }
             }
-            
+
             debug!(
                 "Evaluation from validator: challenge={:?}, execution_time={}ms",
-                result.challenge_id,
-                result.execution_time_ms
+                result.challenge_id, result.execution_time_ms
             );
         }
         NetworkMessage::TaskProgress(progress) => {
@@ -1767,14 +1846,14 @@ async fn handle_message(
                 progress.score,
                 &progress.validator_hotkey[..16.min(progress.validator_hotkey.len())]
             );
-            
+
             // Store task progress in distributed DB for real-time tracking
             if let Some(db) = distributed_db {
                 let progress_key = format!(
                     "{}:{}:{}",
                     progress.agent_hash, progress.task_id, progress.validator_hotkey
                 );
-                
+
                 let progress_data = serde_json::json!({
                     "challenge_id": progress.challenge_id,
                     "agent_hash": progress.agent_hash,
@@ -1790,13 +1869,13 @@ async fn handle_message(
                     "validator_hotkey": progress.validator_hotkey,
                     "timestamp": progress.timestamp,
                 });
-                
+
                 // Store task progress (informational for real-time tracking)
                 // Final results go through consensus Proposals
                 if let Err(e) = db.put(
                     "task_progress",
                     progress_key.as_bytes(),
-                    progress_data.to_string().as_bytes()
+                    progress_data.to_string().as_bytes(),
                 ) {
                     debug!("Failed to store task progress: {}", e);
                 }

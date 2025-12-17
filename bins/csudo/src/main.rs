@@ -524,13 +524,17 @@ async fn main() -> Result<()> {
     }
 
     // Submit each message via RPC
-    info!("Submitting {} messages via RPC to {}...", messages_to_send.len(), args.rpc);
+    info!(
+        "Submitting {} messages via RPC to {}...",
+        messages_to_send.len(),
+        args.rpc
+    );
     let client = reqwest::Client::new();
-    
+
     for msg in &messages_to_send {
         let serialized = bincode::serialize(&msg)?;
         let hex_encoded = hex::encode(&serialized);
-        
+
         let rpc_url = if args.rpc.ends_with("/rpc") {
             args.rpc.clone()
         } else {
@@ -552,12 +556,12 @@ async fn main() -> Result<()> {
             .await?;
 
         let result: serde_json::Value = response.json().await?;
-        
+
         if let Some(error) = result.get("error") {
             eprintln!("RPC Error: {}", error);
             return Ok(());
         }
-        
+
         if let Some(res) = result.get("result") {
             info!("Message submitted: {:?}", res);
         }
