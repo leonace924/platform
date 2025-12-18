@@ -75,9 +75,15 @@ impl ChallengeOrchestrator {
 
     /// Update a challenge (pull new image, restart container)
     pub async fn update_challenge(&self, config: ChallengeContainerConfig) -> anyhow::Result<()> {
-        // Stop old container if exists
-        if let Some(instance) = self.challenges.read().get(&config.challenge_id) {
-            self.docker.stop_container(&instance.container_id).await?;
+        // Stop old container if exists - get container_id first to avoid holding lock across await
+        let old_container_id = {
+            self.challenges
+                .read()
+                .get(&config.challenge_id)
+                .map(|i| i.container_id.clone())
+        };
+        if let Some(container_id) = old_container_id {
+            self.docker.stop_container(&container_id).await?;
         }
 
         // Pull new image and start
@@ -97,9 +103,15 @@ impl ChallengeOrchestrator {
 
     /// Remove a challenge
     pub async fn remove_challenge(&self, challenge_id: ChallengeId) -> anyhow::Result<()> {
-        if let Some(instance) = self.challenges.write().remove(&challenge_id) {
-            self.docker.stop_container(&instance.container_id).await?;
-            self.docker.remove_container(&instance.container_id).await?;
+        // Get container_id and remove from map first to avoid holding lock across await
+        let container_id = self
+            .challenges
+            .write()
+            .remove(&challenge_id)
+            .map(|i| i.container_id);
+        if let Some(container_id) = container_id {
+            self.docker.stop_container(&container_id).await?;
+            self.docker.remove_container(&container_id).await?;
             tracing::info!(challenge_id = %challenge_id, "Challenge container removed");
         }
         Ok(())

@@ -22,7 +22,7 @@ use platform_network::{
     NetworkEvent, NetworkNode, NetworkProtection, NodeConfig, ProtectionConfig, SyncResponse,
     MIN_STAKE_RAO, MIN_STAKE_TAO,
 };
-use platform_rpc::{RpcConfig, RpcServer};
+use platform_rpc::{OrchestratorCommand, RpcConfig, RpcServer};
 use platform_storage::Storage;
 use platform_subnet_manager::BanList;
 use std::collections::HashMap;
@@ -341,7 +341,7 @@ async fn main() -> Result<()> {
     // Start RPC server (if enabled)
     // Challenge-specific logic is handled by Docker containers
     // The validator only proxies requests to challenges via HTTP
-    let (_rpc_handle, rpc_handler, rpc_broadcast_rx) = if args.rpc_port > 0 {
+    let (_rpc_handle, rpc_handler, rpc_broadcast_rx, orchestrator_cmd_rx) = if args.rpc_port > 0 {
         let rpc_addr = format!("{}:{}", args.rpc_addr, args.rpc_port);
         let rpc_config = RpcConfig {
             addr: rpc_addr.parse()?,
@@ -588,6 +588,11 @@ async fn main() -> Result<()> {
             tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         rpc_handler.set_broadcast_tx(rpc_broadcast_tx.clone());
 
+        // Create channel for RPC -> Orchestrator (for challenge container management)
+        let (orchestrator_tx, orchestrator_rx) =
+            tokio::sync::mpsc::unbounded_channel::<OrchestratorCommand>();
+        rpc_handler.set_orchestrator_tx(orchestrator_tx);
+
         // Set keypair for signing P2P messages (for webhook progress broadcasts)
         rpc_handler.set_keypair(keypair.clone());
 
@@ -598,10 +603,11 @@ async fn main() -> Result<()> {
             Some(rpc_server.spawn()),
             Some(rpc_handler),
             Some(rpc_broadcast_rx),
+            Some(orchestrator_rx),
         )
     } else {
         info!("RPC server disabled (--rpc-port 0)");
-        (None, None, None)
+        (None, None, None, None)
     };
 
     // Setup Bittensor connection (if enabled)
@@ -816,6 +822,13 @@ async fn main() -> Result<()> {
                     if let Err(e) = orchestrator.sync_challenges(&configs).await {
                         warn!("Failed to sync challenges: {}", e);
                     }
+
+                    // Discover routes from running containers
+                    // Note: This happens at startup, so routes_map may not be available yet
+                    // Routes will be discovered when containers are added via RPC
+                    info!(
+                        "Challenge sync complete. Routes will be discovered when RPC handler is ready."
+                    );
                 }
 
                 // Start health monitoring in background
@@ -839,6 +852,251 @@ async fn main() -> Result<()> {
         info!("Docker challenge orchestration disabled");
         None
     };
+
+    // Spawn orchestrator command handler (receives commands from RPC sudo_submit)
+    // Also handles dynamic route discovery via /.well-known/routes
+    if let (Some(mut rx), Some(orch)) = (orchestrator_cmd_rx, challenge_orchestrator.clone()) {
+        let routes_map = rpc_handler.as_ref().map(|h| h.challenge_routes.clone());
+        tokio::spawn(async move {
+            info!("Orchestrator command handler started (with route discovery)");
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    OrchestratorCommand::Add(config) => {
+                        info!("RPC -> Orchestrator: Adding challenge '{}'", config.name);
+                        if let Err(e) = orch.add_challenge(config.clone()).await {
+                            error!("Failed to add challenge container '{}': {}", config.name, e);
+                        } else {
+                            info!("Challenge container '{}' started successfully", config.name);
+
+                            // Discover routes from the container via /.well-known/routes
+                            if let Some(ref routes) = routes_map {
+                                let container_name = config.name.to_lowercase().replace(' ', "-");
+                                let routes_url = format!(
+                                    "http://challenge-{}:8080/.well-known/routes",
+                                    container_name
+                                );
+
+                                // Wait a bit for container to be ready
+                                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                                // Retry up to 5 times with backoff
+                                for attempt in 1..=5 {
+                                    match discover_routes(&routes_url).await {
+                                        Ok(manifest) => {
+                                            info!(
+                                                "Discovered {} routes from challenge '{}' (v{})",
+                                                manifest.routes.len(),
+                                                manifest.name,
+                                                manifest.version
+                                            );
+
+                                            // Register discovered routes
+                                            let challenge_routes: Vec<
+                                                platform_challenge_sdk::ChallengeRoute,
+                                            > = manifest
+                                                .routes
+                                                .into_iter()
+                                                .map(|r| {
+                                                    let mut route =
+                                                        platform_challenge_sdk::ChallengeRoute::new(
+                                                            match r.method.as_str() {
+                                                                "POST" => {
+                                                                    platform_challenge_sdk::HttpMethod::Post
+                                                                }
+                                                                "PUT" => {
+                                                                    platform_challenge_sdk::HttpMethod::Put
+                                                                }
+                                                                "DELETE" => {
+                                                                    platform_challenge_sdk::HttpMethod::Delete
+                                                                }
+                                                                _ => {
+                                                                    platform_challenge_sdk::HttpMethod::Get
+                                                                }
+                                                            },
+                                                            r.path,
+                                                            r.description,
+                                                        );
+                                                    route.requires_auth = r.requires_auth;
+                                                    route.rate_limit = r.rate_limit;
+                                                    route
+                                                })
+                                                .collect();
+
+                                            routes
+                                                .write()
+                                                .insert(manifest.name.clone(), challenge_routes);
+                                            info!(
+                                                "Registered routes for challenge '{}'",
+                                                manifest.name
+                                            );
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            if attempt < 5 {
+                                                warn!(
+                                                    "Route discovery attempt {}/5 failed for '{}': {} (retrying...)",
+                                                    attempt, config.name, e
+                                                );
+                                                tokio::time::sleep(std::time::Duration::from_secs(
+                                                    attempt as u64 * 2,
+                                                ))
+                                                .await;
+                                            } else {
+                                                error!(
+                                                    "Route discovery failed for '{}' after 5 attempts: {}",
+                                                    config.name, e
+                                                );
+                                                // Fall back to standard routes
+                                                let default_routes = vec![
+                                                    platform_challenge_sdk::ChallengeRoute::post(
+                                                        "/submit",
+                                                        "Submit an agent",
+                                                    ),
+                                                    platform_challenge_sdk::ChallengeRoute::get(
+                                                        "/status/:hash",
+                                                        "Get agent status",
+                                                    ),
+                                                    platform_challenge_sdk::ChallengeRoute::get(
+                                                        "/leaderboard",
+                                                        "Get leaderboard",
+                                                    ),
+                                                    platform_challenge_sdk::ChallengeRoute::get(
+                                                        "/config",
+                                                        "Get challenge config",
+                                                    ),
+                                                    platform_challenge_sdk::ChallengeRoute::get(
+                                                        "/stats",
+                                                        "Get statistics",
+                                                    ),
+                                                    platform_challenge_sdk::ChallengeRoute::get(
+                                                        "/health",
+                                                        "Health check",
+                                                    ),
+                                                ];
+                                                routes
+                                                    .write()
+                                                    .insert(config.name.clone(), default_routes);
+                                                warn!("Using default routes for '{}'", config.name);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    OrchestratorCommand::Update(config) => {
+                        info!("RPC -> Orchestrator: Updating challenge '{}'", config.name);
+                        if let Err(e) = orch.update_challenge(config.clone()).await {
+                            error!(
+                                "Failed to update challenge container '{}': {}",
+                                config.name, e
+                            );
+                        }
+                    }
+                    OrchestratorCommand::Remove(id) => {
+                        info!("RPC -> Orchestrator: Removing challenge {:?}", id);
+                        if let Err(e) = orch.remove_challenge(id).await {
+                            error!("Failed to remove challenge container {:?}: {}", id, e);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Spawn startup route discovery task for pre-existing challenges
+    // This runs after RPC is ready and discovers routes from containers started at sync
+    if let (Some(ref handler), Some(ref _orch)) = (&rpc_handler, &challenge_orchestrator) {
+        let routes_map = handler.challenge_routes.clone();
+        let state_for_discovery = chain_state.clone();
+        tokio::spawn(async move {
+            // Wait for containers to be fully started
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+            let configs: Vec<ChallengeContainerConfig> = {
+                let state = state_for_discovery.read();
+                state.challenge_configs.values().cloned().collect()
+            };
+
+            for config in configs {
+                let container_name = config.name.to_lowercase().replace(' ', "-");
+                let routes_url = format!(
+                    "http://challenge-{}:8080/.well-known/routes",
+                    container_name
+                );
+
+                info!(
+                    "Discovering routes for startup challenge '{}'...",
+                    config.name
+                );
+
+                match discover_routes(&routes_url).await {
+                    Ok(manifest) => {
+                        info!(
+                            "Discovered {} routes from '{}' (v{})",
+                            manifest.routes.len(),
+                            manifest.name,
+                            manifest.version
+                        );
+
+                        let challenge_routes: Vec<platform_challenge_sdk::ChallengeRoute> =
+                            manifest
+                                .routes
+                                .into_iter()
+                                .map(|r| {
+                                    let mut route = platform_challenge_sdk::ChallengeRoute::new(
+                                        match r.method.as_str() {
+                                            "POST" => platform_challenge_sdk::HttpMethod::Post,
+                                            "PUT" => platform_challenge_sdk::HttpMethod::Put,
+                                            "DELETE" => platform_challenge_sdk::HttpMethod::Delete,
+                                            _ => platform_challenge_sdk::HttpMethod::Get,
+                                        },
+                                        r.path,
+                                        r.description,
+                                    );
+                                    route.requires_auth = r.requires_auth;
+                                    route.rate_limit = r.rate_limit;
+                                    route
+                                })
+                                .collect();
+
+                        routes_map.write().insert(manifest.name, challenge_routes);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to discover routes for '{}': {} (using defaults)",
+                            config.name, e
+                        );
+                        // Use default routes
+                        let default_routes = vec![
+                            platform_challenge_sdk::ChallengeRoute::post(
+                                "/submit",
+                                "Submit an agent",
+                            ),
+                            platform_challenge_sdk::ChallengeRoute::get(
+                                "/status/:hash",
+                                "Get agent status",
+                            ),
+                            platform_challenge_sdk::ChallengeRoute::get(
+                                "/leaderboard",
+                                "Get leaderboard",
+                            ),
+                            platform_challenge_sdk::ChallengeRoute::get(
+                                "/config",
+                                "Get challenge config",
+                            ),
+                            platform_challenge_sdk::ChallengeRoute::get("/stats", "Get statistics"),
+                            platform_challenge_sdk::ChallengeRoute::get("/health", "Health check"),
+                        ];
+                        routes_map
+                            .write()
+                            .insert(config.name.clone(), default_routes);
+                    }
+                }
+            }
+            info!("Startup route discovery complete");
+        });
+    }
 
     // Main event loop
     info!("Validator node running. Press Ctrl+C to stop.");
@@ -1973,4 +2231,43 @@ fn handle_sync_request(
         }
         SyncRequest::Challenge { id: _ } => SyncResponse::Challenge { data: None },
     }
+}
+
+/// Response from /.well-known/routes endpoint
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RoutesManifestResponse {
+    name: String,
+    version: String,
+    #[allow(dead_code)]
+    description: String,
+    routes: Vec<RouteEntry>,
+    #[allow(dead_code)]
+    metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RouteEntry {
+    method: String,
+    path: String,
+    description: String,
+    #[serde(default)]
+    requires_auth: bool,
+    #[serde(default)]
+    rate_limit: u32,
+}
+
+/// Discover routes from a challenge container via /.well-known/routes
+async fn discover_routes(url: &str) -> anyhow::Result<RoutesManifestResponse> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let response = client.get(url).send().await?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Route discovery failed with status: {}", response.status());
+    }
+
+    let manifest: RoutesManifestResponse = response.json().await?;
+    Ok(manifest)
 }

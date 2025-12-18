@@ -189,6 +189,21 @@ pub struct RpcHandler {
     pub broadcast_tx: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>,
     /// Keypair for signing P2P messages (optional, set by validator)
     pub keypair: Arc<RwLock<Option<platform_core::Keypair>>>,
+    /// Channel to trigger orchestrator for challenge container management
+    /// Sends (action, config) where action is "add", "update", or "remove"
+    pub orchestrator_tx:
+        Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<OrchestratorCommand>>>>,
+}
+
+/// Command to send to the orchestrator
+#[derive(Debug, Clone)]
+pub enum OrchestratorCommand {
+    /// Add and start a new challenge container
+    Add(platform_core::ChallengeContainerConfig),
+    /// Update a challenge (pull new image, restart)
+    Update(platform_core::ChallengeContainerConfig),
+    /// Remove a challenge container
+    Remove(platform_core::ChallengeId),
 }
 
 impl RpcHandler {
@@ -204,6 +219,7 @@ impl RpcHandler {
             route_handler: Arc::new(RwLock::new(None)),
             broadcast_tx: Arc::new(RwLock::new(None)),
             keypair: Arc::new(RwLock::new(None)),
+            orchestrator_tx: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -215,6 +231,23 @@ impl RpcHandler {
     /// Set the broadcast channel for P2P message sending
     pub fn set_broadcast_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
         *self.broadcast_tx.write() = Some(tx);
+    }
+
+    /// Set the orchestrator channel for challenge container management
+    pub fn set_orchestrator_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<OrchestratorCommand>) {
+        *self.orchestrator_tx.write() = Some(tx);
+    }
+
+    /// Normalize challenge name: lowercase, replace spaces with dashes, remove special chars
+    pub fn normalize_challenge_name(name: &str) -> String {
+        name.trim()
+            .to_lowercase()
+            .replace([' ', '_'], "-")
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '-')
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string()
     }
 
     /// Register routes for a challenge
@@ -1221,34 +1254,105 @@ impl RpcHandler {
         }
 
         // Also apply locally since gossipsub doesn't echo back to sender
-        // Check if this is a Proposal containing SudoAction::AddChallenge
+        // Handle SudoActions: AddChallenge, UpdateChallenge, RemoveChallenge
         if let platform_core::NetworkMessage::Proposal(ref proposal) = signed.message {
-            if let platform_core::ProposalAction::Sudo(platform_core::SudoAction::AddChallenge {
-                config,
-            }) = &proposal.action
-            {
-                // Apply locally
-                let mut chain = self.chain_state.write();
-                chain
-                    .challenge_configs
-                    .insert(config.challenge_id, config.clone());
-                info!(
-                    "Applied AddChallenge locally: {} ({})",
-                    config.name, config.challenge_id
-                );
+            match &proposal.action {
+                platform_core::ProposalAction::Sudo(platform_core::SudoAction::AddChallenge {
+                    config,
+                }) => {
+                    // Normalize the challenge name (no spaces, lowercase, dashes)
+                    let mut normalized_config = config.clone();
+                    normalized_config.name = Self::normalize_challenge_name(&config.name);
 
-                // Also register routes
-                drop(chain);
-                use platform_challenge_sdk::ChallengeRoute;
-                let routes = vec![
-                    ChallengeRoute::post("/submit", "Submit an agent"),
-                    ChallengeRoute::get("/status/:hash", "Get agent status"),
-                    ChallengeRoute::get("/leaderboard", "Get leaderboard"),
-                    ChallengeRoute::get("/config", "Get challenge config"),
-                    ChallengeRoute::get("/stats", "Get statistics"),
-                    ChallengeRoute::get("/health", "Health check"),
-                ];
-                self.register_challenge_routes(&config.name, routes);
+                    // Apply locally
+                    {
+                        let mut chain = self.chain_state.write();
+                        chain
+                            .challenge_configs
+                            .insert(normalized_config.challenge_id, normalized_config.clone());
+                    }
+                    info!(
+                        "Applied AddChallenge locally: {} ({})",
+                        normalized_config.name, normalized_config.challenge_id
+                    );
+
+                    // Register routes with normalized name
+                    use platform_challenge_sdk::ChallengeRoute;
+                    let routes = vec![
+                        ChallengeRoute::post("/submit", "Submit an agent"),
+                        ChallengeRoute::get("/status/:hash", "Get agent status"),
+                        ChallengeRoute::get("/leaderboard", "Get leaderboard"),
+                        ChallengeRoute::get("/config", "Get challenge config"),
+                        ChallengeRoute::get("/stats", "Get statistics"),
+                        ChallengeRoute::get("/health", "Health check"),
+                    ];
+                    self.register_challenge_routes(&normalized_config.name, routes);
+
+                    // Trigger orchestrator to start the Docker container
+                    if let Some(tx) = self.orchestrator_tx.read().as_ref() {
+                        if let Err(e) = tx.send(OrchestratorCommand::Add(normalized_config.clone()))
+                        {
+                            warn!("Failed to send to orchestrator: {}", e);
+                        } else {
+                            info!(
+                                "Sent AddChallenge to orchestrator: {}",
+                                normalized_config.name
+                            );
+                        }
+                    } else {
+                        warn!(
+                            "Orchestrator channel not configured - container won't start automatically"
+                        );
+                    }
+                }
+                platform_core::ProposalAction::Sudo(
+                    platform_core::SudoAction::UpdateChallenge { config },
+                ) => {
+                    // Normalize name
+                    let mut normalized_config = config.clone();
+                    normalized_config.name = Self::normalize_challenge_name(&config.name);
+
+                    // Apply locally
+                    {
+                        let mut chain = self.chain_state.write();
+                        chain
+                            .challenge_configs
+                            .insert(normalized_config.challenge_id, normalized_config.clone());
+                    }
+                    info!(
+                        "Applied UpdateChallenge locally: {} ({})",
+                        normalized_config.name, normalized_config.challenge_id
+                    );
+
+                    // Trigger orchestrator to update the container
+                    if let Some(tx) = self.orchestrator_tx.read().as_ref() {
+                        if let Err(e) =
+                            tx.send(OrchestratorCommand::Update(normalized_config.clone()))
+                        {
+                            warn!("Failed to send to orchestrator: {}", e);
+                        }
+                    }
+                }
+                platform_core::ProposalAction::Sudo(
+                    platform_core::SudoAction::RemoveChallenge { id },
+                ) => {
+                    // Apply locally
+                    {
+                        let mut chain = self.chain_state.write();
+                        chain.challenge_configs.remove(id);
+                    }
+                    info!("Applied RemoveChallenge locally: {:?}", id);
+
+                    // Trigger orchestrator to stop the container
+                    if let Some(tx) = self.orchestrator_tx.read().as_ref() {
+                        if let Err(e) = tx.send(OrchestratorCommand::Remove(*id)) {
+                            warn!("Failed to send to orchestrator: {}", e);
+                        }
+                    }
+                }
+                _ => {
+                    // Other sudo actions - just apply to state
+                }
             }
         }
 

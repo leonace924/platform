@@ -39,6 +39,84 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// Routes manifest returned by /.well-known/routes endpoint
+/// This is the standard format for dynamic route discovery
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutesManifest {
+    /// Challenge name (normalized: lowercase, dashes only)
+    pub name: String,
+    /// Challenge version
+    pub version: String,
+    /// Human-readable description
+    pub description: String,
+    /// List of available routes
+    pub routes: Vec<ChallengeRoute>,
+    /// Optional metadata
+    #[serde(default)]
+    pub metadata: HashMap<String, Value>,
+}
+
+impl RoutesManifest {
+    /// Create a new routes manifest
+    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            name: Self::normalize_name(&name.into()),
+            version: version.into(),
+            description: String::new(),
+            routes: Vec::new(),
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// Normalize challenge name: lowercase, replace spaces/underscores with dashes
+    pub fn normalize_name(name: &str) -> String {
+        name.trim()
+            .to_lowercase()
+            .replace([' ', '_'], "-")
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '-')
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string()
+    }
+
+    /// Set description
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    /// Add a single route
+    pub fn add_route(mut self, route: ChallengeRoute) -> Self {
+        self.routes.push(route);
+        self
+    }
+
+    /// Add multiple routes
+    pub fn with_routes(mut self, routes: Vec<ChallengeRoute>) -> Self {
+        self.routes.extend(routes);
+        self
+    }
+
+    /// Add metadata
+    pub fn with_metadata(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.metadata.insert(key.into(), value);
+        self
+    }
+
+    /// Build standard routes that most challenges should implement
+    pub fn with_standard_routes(self) -> Self {
+        self.with_routes(vec![
+            ChallengeRoute::post("/submit", "Submit an agent for evaluation"),
+            ChallengeRoute::get("/status/:hash", "Get agent evaluation status"),
+            ChallengeRoute::get("/leaderboard", "Get current leaderboard"),
+            ChallengeRoute::get("/config", "Get challenge configuration"),
+            ChallengeRoute::get("/stats", "Get challenge statistics"),
+            ChallengeRoute::get("/health", "Health check endpoint"),
+        ])
+    }
+}
+
 /// HTTP method for routes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
