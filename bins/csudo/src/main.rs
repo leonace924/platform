@@ -1,41 +1,67 @@
-//! Chain Sudo (csudo) - Administrative CLI for Platform Chain
+//! Chain Sudo (csudo) - Beautiful Administrative CLI for Platform Chain
 //!
 //! Provides subnet owners with administrative commands for managing
-//! challenges, validators, and network configuration.
+//! challenges, validators, mechanisms, and network configuration.
+//!
+//! Usage:
+//!   csudo list challenges        - List all challenges
+//!   csudo list mechanisms        - List mechanism configs
+//!   csudo list validators        - List validators
+//!   csudo add challenge          - Add a new challenge (interactive)
+//!   csudo edit challenge <id>    - Edit a challenge
+//!   csudo remove challenge <id>  - Remove a challenge
+//!   csudo status                 - Show network status
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use colored::Colorize;
+use comfy_table::{presets::UTF8_FULL, Cell, Color, ContentArrangement, Table};
+use console::Term;
+use dialoguer::{theme::ColorfulTheme, Confirm, FuzzySelect, Input, Select};
+use indicatif::{ProgressBar, ProgressStyle};
 use parking_lot::RwLock;
 use platform_consensus::PBFTEngine;
 use platform_core::{
-    ChainState, ChallengeContainerConfig, ChallengeId, Hotkey, Keypair, MechanismWeightConfig,
-    NetworkConfig, SignedNetworkMessage, Stake, SudoAction, ValidatorInfo,
+    ChainState, ChallengeContainerConfig, ChallengeId, Hotkey, Keypair, NetworkConfig,
+    SignedNetworkMessage, Stake, SudoAction, ValidatorInfo,
 };
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::info;
+
+const BANNER: &str = r#"
+   _____ _____ _   _ _____   ____  
+  / ____/ ____| | | |  __ \ / __ \ 
+ | |   | (___ | | | | |  | | |  | |
+ | |    \___ \| | | | |  | | |  | |
+ | |____  ___) | |__| | |__| | |__| |
+  \_____|____/  \____/|_____/ \____/ 
+                                     
+  Platform Chain Admin CLI v0.1.0
+"#;
 
 #[derive(Parser, Debug)]
 #[command(name = "csudo")]
 #[command(about = "Platform Chain administrative CLI for subnet owners")]
+#[command(version, author)]
 struct Args {
     /// Secret key or mnemonic (REQUIRED - subnet owner must be registered)
-    /// Can be hex encoded 32 bytes or BIP39 mnemonic phrase
-    #[arg(short, long, env = "SUDO_SECRET_KEY", required = true)]
-    secret_key: String,
+    #[arg(short, long, env = "SUDO_SECRET_KEY", global = true)]
+    secret_key: Option<String>,
 
-    /// Network peer to connect to (P2P)
-    #[arg(short, long, default_value = "/ip4/127.0.0.1/tcp/9000")]
-    peer: String,
-
-    /// RPC server URL for queries
+    /// RPC server URL
     #[arg(
         short,
         long,
-        default_value = "https://chain.platform.network",
-        env = "PLATFORM_RPC"
+        default_value = "http://localhost:8080",
+        env = "PLATFORM_RPC",
+        global = true
     )]
     rpc: String,
+
+    /// Quiet mode (less output)
+    #[arg(short, long, global = true)]
+    quiet: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -43,695 +69,532 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// List resources (challenges, mechanisms, validators)
+    #[command(subcommand)]
+    List(ListCommands),
+
+    /// Add resources
+    #[command(subcommand)]
+    Add(AddCommands),
+
+    /// Edit resources
+    #[command(subcommand)]
+    Edit(EditCommands),
+
+    /// Remove resources
+    #[command(subcommand)]
+    Remove(RemoveCommands),
+
+    /// Set configuration
+    #[command(subcommand)]
+    Set(SetCommands),
+
+    /// Show network status
+    Status,
+
+    /// Interactive mode - manage everything from a menu
+    Interactive,
+
     /// Generate a new keypair
-    GenerateKey,
+    Keygen,
 
-    /// Add a challenge (Docker container)
-    AddChallenge {
-        /// Challenge name
+    /// Emergency commands
+    #[command(subcommand)]
+    Emergency(EmergencyCommands),
+}
+
+#[derive(Subcommand, Debug)]
+enum ListCommands {
+    /// List all challenges
+    Challenges,
+    /// List mechanism configurations
+    Mechanisms,
+    /// List validators
+    Validators,
+    /// Show everything
+    All,
+}
+
+#[derive(Subcommand, Debug)]
+enum AddCommands {
+    /// Add a new challenge
+    Challenge {
+        /// Challenge name (optional - interactive if not provided)
         #[arg(short, long)]
-        name: String,
-
-        /// Docker image (e.g., "ghcr.io/platformnetwork/term-challenge:37cd137")
+        name: Option<String>,
+        /// Docker image
         #[arg(short, long)]
-        docker_image: String,
-
-        /// Mechanism ID on Bittensor (1, 2, 3... - each mechanism can have multiple challenges)
+        docker_image: Option<String>,
+        /// Mechanism ID
         #[arg(short, long)]
-        mechanism_id: u8,
-
-        /// Timeout in seconds
-        #[arg(long, default_value = "3600")]
-        timeout: u64,
-
-        /// Emission weight (0.0 - 1.0) - portion of mechanism weights this challenge receives
-        #[arg(long, default_value = "1.0")]
-        emission_weight: f64,
-
-        /// CPU cores
-        #[arg(long, default_value = "2.0")]
-        cpu_cores: f64,
-
-        /// Memory in MB
-        #[arg(long, default_value = "4096")]
-        memory_mb: u64,
-
-        /// Requires GPU
-        #[arg(long, default_value = "false")]
-        gpu: bool,
+        mechanism_id: Option<u8>,
     },
-
-    /// Update a challenge (new Docker image)
-    UpdateChallenge {
-        /// Challenge ID (UUID)
+    /// Add a validator
+    Validator {
+        /// Validator hotkey (hex)
+        #[arg(short = 'k', long)]
+        hotkey: Option<String>,
+        /// Stake in TAO
         #[arg(short, long)]
-        id: String,
-
-        /// New Docker image
-        #[arg(short, long)]
-        docker_image: String,
+        stake: Option<f64>,
     },
+}
 
+#[derive(Subcommand, Debug)]
+enum EditCommands {
+    /// Edit a challenge
+    Challenge {
+        /// Challenge ID (optional - select from list if not provided)
+        id: Option<String>,
+    },
+    /// Edit mechanism config
+    Mechanism {
+        /// Mechanism ID
+        id: Option<u8>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RemoveCommands {
     /// Remove a challenge
-    RemoveChallenge {
-        /// Challenge ID (UUID)
-        #[arg(short, long)]
-        id: String,
+    Challenge {
+        /// Challenge ID (optional - select from list if not provided)
+        id: Option<String>,
     },
+    /// Remove a validator
+    Validator {
+        /// Validator hotkey
+        hotkey: Option<String>,
+    },
+}
 
-    /// Set challenge weight ratio on a mechanism
-    SetChallengeWeight {
-        /// Challenge ID (UUID)
+#[derive(Subcommand, Debug)]
+enum SetCommands {
+    /// Set challenge weight on mechanism
+    Weight {
+        /// Challenge ID
         #[arg(short, long)]
-        id: String,
-
+        challenge_id: Option<String>,
         /// Mechanism ID
         #[arg(short, long)]
-        mechanism_id: u8,
-
-        /// Weight ratio (0.0 - 1.0) - if multiple challenges share a mechanism, ratios are normalized
+        mechanism_id: Option<u8>,
+        /// Weight ratio (0.0 - 1.0)
         #[arg(short, long)]
-        weight: f64,
+        weight: Option<f64>,
     },
-
-    /// Set mechanism burn rate (portion of weights that go to UID 0)
-    SetMechanismBurn {
-        /// Mechanism ID
-        #[arg(short, long)]
-        mechanism_id: u8,
-
-        /// Burn rate (0.0 - 1.0), e.g., 0.1 = 10% to UID 0
-        #[arg(short, long)]
-        burn_rate: f64,
-    },
-
-    /// Configure mechanism weight distribution
-    SetMechanismConfig {
-        /// Mechanism ID
-        #[arg(short, long)]
-        mechanism_id: u8,
-
-        /// Burn rate (0.0 - 1.0)
-        #[arg(long, default_value = "0.0")]
-        burn_rate: f64,
-
-        /// Max weight cap per miner (0.0 = no cap, 0.5 = max 50%)
-        #[arg(long, default_value = "0.5")]
-        max_cap: f64,
-
-        /// Minimum weight threshold (prevents dust)
-        #[arg(long, default_value = "0.0001")]
-        min_threshold: f64,
-
-        /// Equal distribution among challenges (vs per-challenge ratios)
-        #[arg(long, default_value = "false")]
-        equal_distribution: bool,
-    },
-
     /// Set required validator version
-    SetVersion {
-        /// Minimum required version (e.g., "0.2.0")
+    Version {
+        /// Version string (e.g., "0.2.0")
         #[arg(short, long)]
         version: String,
-
-        /// Docker image for validators
+        /// Docker image
         #[arg(short, long)]
         docker_image: String,
-
-        /// Mandatory update (validators must update)
-        #[arg(long, default_value = "false")]
+        /// Mandatory update
+        #[arg(long)]
         mandatory: bool,
-
-        /// Deadline block (optional)
-        #[arg(long)]
-        deadline_block: Option<u64>,
     },
+}
 
-    /// List challenges (query from network)
-    ListChallenges,
-
-    /// List mechanism configurations
-    ListMechanisms,
-
-    /// Add a validator
-    AddValidator {
-        /// Validator hotkey (hex)
-        #[arg(short, long)]
-        hotkey: String,
-
-        /// Stake amount in TAO
-        #[arg(short, long, default_value = "10")]
-        stake: f64,
-    },
-
-    /// Remove a validator
-    RemoveValidator {
-        /// Validator hotkey (hex)
-        #[arg(short, long)]
-        hotkey: String,
-    },
-
-    /// Update network configuration
-    UpdateConfig {
-        /// Minimum stake in TAO
-        #[arg(long)]
-        min_stake: Option<f64>,
-
-        /// Consensus threshold (0.0-1.0)
-        #[arg(long)]
-        threshold: Option<f64>,
-
-        /// Block time in milliseconds
-        #[arg(long)]
-        block_time: Option<u64>,
-    },
-
-    /// Emergency pause the network
+#[derive(Subcommand, Debug)]
+enum EmergencyCommands {
+    /// Pause the network
     Pause {
         /// Reason for pause
         #[arg(short, long)]
         reason: String,
     },
-
     /// Resume the network
     Resume,
-
-    /// Show network status
-    Status,
 }
 
-/// Derive keypair from BIP39 mnemonic using sr25519 (Substrate/Bittensor standard)
-fn derive_keypair_from_mnemonic(mnemonic_str: &str) -> Result<Keypair> {
-    let keypair = Keypair::from_mnemonic(mnemonic_str)?;
+// ==================== State Fetching ====================
 
-    info!("Derived sr25519 keypair from mnemonic");
-    info!("Hotkey: {}", keypair.hotkey().to_hex());
-    info!("SS58 Address: {}", keypair.ss58_address());
-
-    Ok(keypair)
+#[derive(Debug, Clone, Default)]
+struct ChainStateData {
+    block_height: u64,
+    epoch: u64,
+    challenges: Vec<ChallengeData>,
+    mechanisms: Vec<MechanismData>,
+    validators: Vec<ValidatorData>,
+    challenge_weights: Vec<WeightData>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+#[derive(Debug, Clone)]
+struct ChallengeData {
+    id: String,
+    name: String,
+    docker_image: String,
+    mechanism_id: u8,
+    emission_weight: f64,
+    timeout_secs: u64,
+    cpu_cores: f64,
+    memory_mb: u64,
+    gpu_required: bool,
+}
 
-    let args = Args::parse();
+#[derive(Debug, Clone)]
+struct MechanismData {
+    id: u8,
+    burn_rate: f64,
+    max_cap: f64,
+    min_threshold: f64,
+    equal_distribution: bool,
+    active: bool,
+}
 
-    // Handle generate-key command separately
-    if let Commands::GenerateKey = args.command {
-        let keypair = Keypair::generate();
-        println!("Generated new sr25519 keypair:");
-        println!("  Hotkey (hex):   {}", keypair.hotkey().to_hex());
-        println!("  SS58 Address:   {}", keypair.ss58_address());
-        println!("  Seed (secret):  {}", hex::encode(keypair.seed()));
-        println!();
-        println!("To use with csudo (use mnemonic or seed):");
-        println!("  export SUDO_SECRET_KEY=\"your 24-word mnemonic phrase\"");
-        return Ok(());
+#[derive(Debug, Clone)]
+struct ValidatorData {
+    hotkey: String,
+    stake: u64,
+    stake_tao: f64,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct WeightData {
+    challenge_id: String,
+    mechanism_id: u8,
+    weight_ratio: f64,
+    active: bool,
+}
+
+async fn fetch_chain_state(rpc_url: &str) -> Result<ChainStateData> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/rpc", rpc_url.trim_end_matches('/'));
+
+    let response = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "chain_getState",
+            "params": [],
+            "id": 1
+        }))
+        .send()
+        .await?;
+
+    let result: serde_json::Value = response.json().await?;
+
+    if let Some(error) = result.get("error") {
+        anyhow::bail!("RPC Error: {}", error);
     }
 
-    // Parse secret key (hex seed or mnemonic)
-    let keypair = {
-        let secret = args.secret_key.trim();
+    let state = result
+        .get("result")
+        .ok_or_else(|| anyhow::anyhow!("No result"))?;
 
-        // Strip 0x prefix if present
-        let hex_str = secret.strip_prefix("0x").unwrap_or(secret);
+    let block_height = state
+        .get("blockHeight")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let epoch = state.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
 
-        // Try hex decode first (64 hex chars = 32 bytes seed)
-        if hex_str.len() == 64 {
-            if let Ok(bytes) = hex::decode(hex_str) {
-                if bytes.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&bytes);
-                    info!("Loaded sr25519 keypair from hex seed");
-                    Keypair::from_seed(&arr)?
-                } else {
-                    anyhow::bail!("Hex seed must be 32 bytes");
-                }
-            } else {
-                // Not valid hex, try as mnemonic
-                derive_keypair_from_mnemonic(secret)?
-            }
-        } else {
-            // Assume it's a mnemonic phrase
-            derive_keypair_from_mnemonic(secret)?
-        }
+    let mut data = ChainStateData {
+        block_height,
+        epoch,
+        ..Default::default()
     };
 
-    info!("Subnet owner SS58: {}", keypair.ss58_address());
-    info!("Hotkey (hex): {}", keypair.hotkey().to_hex());
+    // Parse challenges
+    if let Some(configs) = state.get("challenge_configs").and_then(|v| v.as_object()) {
+        for (id, config) in configs {
+            data.challenges.push(ChallengeData {
+                id: id.clone(),
+                name: config
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                docker_image: config
+                    .get("docker_image")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                mechanism_id: config
+                    .get("mechanism_id")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u8,
+                emission_weight: config
+                    .get("emission_weight")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0),
+                timeout_secs: config
+                    .get("timeout_secs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(3600),
+                cpu_cores: config
+                    .get("cpu_cores")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(2.0),
+                memory_mb: config
+                    .get("memory_mb")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(4096),
+                gpu_required: config
+                    .get("gpu_required")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            });
+        }
+    }
 
-    // Create a temporary chain state (we'll sync from network)
+    // Parse mechanisms
+    if let Some(configs) = state.get("mechanism_configs").and_then(|v| v.as_object()) {
+        for (id, config) in configs {
+            data.mechanisms.push(MechanismData {
+                id: id.parse().unwrap_or(0),
+                burn_rate: config
+                    .get("base_burn_rate")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                max_cap: config
+                    .get("max_weight_cap")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.5),
+                min_threshold: config
+                    .get("min_weight_threshold")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0001),
+                equal_distribution: config
+                    .get("equal_distribution")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                active: config
+                    .get("is_active")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+            });
+        }
+    }
+
+    // Parse validators
+    if let Some(validators) = state.get("validators").and_then(|v| v.as_object()) {
+        for (hotkey, info) in validators {
+            data.validators.push(ValidatorData {
+                hotkey: hotkey.clone(),
+                stake: info.get("stake").and_then(|v| v.as_u64()).unwrap_or(0),
+                stake_tao: info
+                    .get("stake_tao")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+            });
+        }
+    }
+
+    // Parse weights
+    if let Some(weights) = state.get("challenge_weights").and_then(|v| v.as_object()) {
+        for (id, alloc) in weights {
+            data.challenge_weights.push(WeightData {
+                challenge_id: id.clone(),
+                mechanism_id: alloc
+                    .get("mechanism_id")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u8,
+                weight_ratio: alloc
+                    .get("weight_ratio")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0),
+                active: alloc
+                    .get("active")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+            });
+        }
+    }
+
+    Ok(data)
+}
+
+// ==================== Display Functions ====================
+
+fn print_banner() {
+    println!("{}", BANNER.cyan());
+}
+
+fn print_section(title: &str) {
+    println!("\n{}", format!("━━━ {} ━━━", title).bright_blue().bold());
+}
+
+fn display_challenges(challenges: &[ChallengeData]) {
+    if challenges.is_empty() {
+        println!("{}", "  No challenges registered.".yellow());
+        return;
+    }
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("Name").fg(Color::Cyan),
+            Cell::new("ID").fg(Color::Cyan),
+            Cell::new("Mechanism").fg(Color::Cyan),
+            Cell::new("Weight").fg(Color::Cyan),
+            Cell::new("Docker Image").fg(Color::Cyan),
+            Cell::new("Resources").fg(Color::Cyan),
+        ]);
+
+    for c in challenges {
+        let resources = format!(
+            "{}cpu/{}MB{}",
+            c.cpu_cores,
+            c.memory_mb,
+            if c.gpu_required { "/GPU" } else { "" }
+        );
+        table.add_row(vec![
+            Cell::new(&c.name).fg(Color::Green),
+            Cell::new(&c.id[..8.min(c.id.len())]),
+            Cell::new(c.mechanism_id.to_string()),
+            Cell::new(format!("{:.0}%", c.emission_weight * 100.0)),
+            Cell::new(&c.docker_image[..40.min(c.docker_image.len())]),
+            Cell::new(resources),
+        ]);
+    }
+
+    println!("{table}");
+}
+
+fn display_mechanisms(mechanisms: &[MechanismData]) {
+    if mechanisms.is_empty() {
+        println!("{}", "  No mechanism configs (using defaults).".yellow());
+        return;
+    }
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("ID").fg(Color::Cyan),
+            Cell::new("Burn Rate").fg(Color::Cyan),
+            Cell::new("Max Cap").fg(Color::Cyan),
+            Cell::new("Min Threshold").fg(Color::Cyan),
+            Cell::new("Equal Dist").fg(Color::Cyan),
+            Cell::new("Active").fg(Color::Cyan),
+        ]);
+
+    for m in mechanisms {
+        table.add_row(vec![
+            Cell::new(m.id.to_string()).fg(Color::Green),
+            Cell::new(format!("{:.1}%", m.burn_rate * 100.0)),
+            Cell::new(format!("{:.1}%", m.max_cap * 100.0)),
+            Cell::new(format!("{:.4}", m.min_threshold)),
+            Cell::new(if m.equal_distribution { "Yes" } else { "No" }),
+            Cell::new(if m.active { "✓" } else { "✗" }).fg(if m.active {
+                Color::Green
+            } else {
+                Color::Red
+            }),
+        ]);
+    }
+
+    println!("{table}");
+}
+
+fn display_validators(validators: &[ValidatorData]) {
+    if validators.is_empty() {
+        println!("{}", "  No validators registered.".yellow());
+        return;
+    }
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("Hotkey").fg(Color::Cyan),
+            Cell::new("Stake (TAO)").fg(Color::Cyan),
+            Cell::new("Stake (RAO)").fg(Color::Cyan),
+        ]);
+
+    for v in validators {
+        table.add_row(vec![
+            Cell::new(&v.hotkey[..16.min(v.hotkey.len())]).fg(Color::Green),
+            Cell::new(format!("{:.2}", v.stake_tao)),
+            Cell::new(v.stake.to_string()),
+        ]);
+    }
+
+    println!("{table}");
+}
+
+fn display_status(state: &ChainStateData) {
+    println!("\n{}", "Network Status".bright_green().bold());
+    println!(
+        "  {} {}",
+        "Block Height:".bright_white(),
+        state.block_height.to_string().cyan()
+    );
+    println!(
+        "  {} {}",
+        "Epoch:".bright_white(),
+        state.epoch.to_string().cyan()
+    );
+    println!(
+        "  {} {}",
+        "Challenges:".bright_white(),
+        state.challenges.len().to_string().cyan()
+    );
+    println!(
+        "  {} {}",
+        "Mechanisms:".bright_white(),
+        state.mechanisms.len().to_string().cyan()
+    );
+    println!(
+        "  {} {}",
+        "Validators:".bright_white(),
+        state.validators.len().to_string().cyan()
+    );
+}
+
+// ==================== Action Submission ====================
+
+async fn submit_action(rpc_url: &str, keypair: &Keypair, action: SudoAction) -> Result<()> {
     let chain_state = Arc::new(RwLock::new(ChainState::new(
         keypair.hotkey(),
         NetworkConfig::default(),
     )));
 
-    // Create message channel
     let (msg_tx, mut msg_rx) = mpsc::channel::<SignedNetworkMessage>(100);
-
-    // Create consensus engine
     let consensus = PBFTEngine::new(keypair.clone(), chain_state.clone(), msg_tx);
 
-    // Execute command
-    let action = match args.command {
-        Commands::GenerateKey => unreachable!(),
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .unwrap(),
+    );
+    pb.set_message("Creating signed action...");
+    pb.enable_steady_tick(Duration::from_millis(100));
 
-        Commands::AddChallenge {
-            name,
-            docker_image,
-            mechanism_id,
-            timeout,
-            emission_weight,
-            cpu_cores,
-            memory_mb,
-            gpu,
-        } => {
-            let config = ChallengeContainerConfig {
-                challenge_id: ChallengeId::new(),
-                name: name.clone(),
-                docker_image: docker_image.clone(),
-                mechanism_id,
-                emission_weight,
-                timeout_secs: timeout,
-                cpu_cores,
-                memory_mb,
-                gpu_required: gpu,
-            };
+    let _proposal_id = consensus.propose_sudo(action).await?;
 
-            info!(
-                "Adding challenge: {} (image: {}, mechanism: {}, weight: {:.0}%)",
-                name,
-                docker_image,
-                mechanism_id,
-                emission_weight * 100.0
-            );
-            SudoAction::AddChallenge { config }
-        }
-
-        Commands::UpdateChallenge { id, docker_image } => {
-            let challenge_id = ChallengeId(uuid::Uuid::parse_str(&id)?);
-            info!("Updating challenge {} to image {}", id, docker_image);
-
-            let config = ChallengeContainerConfig {
-                challenge_id,
-                name: format!("challenge-{}", &id[..8]),
-                docker_image,
-                mechanism_id: 1,
-                emission_weight: 1.0,
-                timeout_secs: 3600,
-                cpu_cores: 2.0,
-                memory_mb: 4096,
-                gpu_required: false,
-            };
-
-            SudoAction::UpdateChallenge { config }
-        }
-
-        Commands::RemoveChallenge { id } => {
-            let challenge_id = ChallengeId(uuid::Uuid::parse_str(&id)?);
-            info!("Removing challenge: {}", id);
-            SudoAction::RemoveChallenge { id: challenge_id }
-        }
-
-        Commands::SetChallengeWeight {
-            id,
-            mechanism_id,
-            weight,
-        } => {
-            let challenge_id = ChallengeId(uuid::Uuid::parse_str(&id)?);
-            info!(
-                "Setting challenge {} weight on mechanism {} to {:.2}%",
-                id,
-                mechanism_id,
-                weight * 100.0
-            );
-            SudoAction::SetChallengeWeight {
-                challenge_id,
-                mechanism_id,
-                weight_ratio: weight,
-            }
-        }
-
-        Commands::SetMechanismBurn {
-            mechanism_id,
-            burn_rate,
-        } => {
-            info!(
-                "Setting mechanism {} burn rate to {:.2}%",
-                mechanism_id,
-                burn_rate * 100.0
-            );
-            SudoAction::SetMechanismBurnRate {
-                mechanism_id,
-                burn_rate,
-            }
-        }
-
-        Commands::SetMechanismConfig {
-            mechanism_id,
-            burn_rate,
-            max_cap,
-            min_threshold,
-            equal_distribution,
-        } => {
-            let config = MechanismWeightConfig {
-                mechanism_id,
-                base_burn_rate: burn_rate,
-                equal_distribution,
-                min_weight_threshold: min_threshold,
-                max_weight_cap: max_cap,
-                active: true,
-            };
-            info!(
-                "Setting mechanism {} config: burn={:.2}%, cap={:.2}%, equal={}",
-                mechanism_id,
-                burn_rate * 100.0,
-                max_cap * 100.0,
-                equal_distribution
-            );
-            SudoAction::SetMechanismConfig {
-                mechanism_id,
-                config,
-            }
-        }
-
-        Commands::SetVersion {
-            version,
-            docker_image,
-            mandatory,
-            deadline_block,
-        } => {
-            info!(
-                "Setting required version: {} (mandatory: {})",
-                version, mandatory
-            );
-            SudoAction::SetRequiredVersion {
-                min_version: version.clone(),
-                recommended_version: version,
-                docker_image,
-                mandatory,
-                deadline_block,
-                release_notes: None,
-            }
-        }
-
-        Commands::ListChallenges => {
-            let client = reqwest::Client::new();
-            let rpc_url = format!("{}/rpc", args.rpc.trim_end_matches('/'));
-
-            let response = client
-                .post(&rpc_url)
-                .json(&serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "chain_getState",
-                    "params": [],
-                    "id": 1
-                }))
-                .send()
-                .await?;
-
-            let result: serde_json::Value = response.json().await?;
-
-            if let Some(error) = result.get("error") {
-                eprintln!("RPC Error: {}", error);
-                return Ok(());
-            }
-
-            if let Some(state) = result.get("result") {
-                println!("=== Challenge Configs ===");
-                if let Some(configs) = state.get("challenge_configs") {
-                    if let Some(obj) = configs.as_object() {
-                        if obj.is_empty() {
-                            println!("No challenges registered.");
-                        } else {
-                            for (id, config) in obj {
-                                println!("\nID: {}", id);
-                                if let Some(name) = config.get("name") {
-                                    println!("  Name: {}", name);
-                                }
-                                if let Some(image) = config.get("docker_image") {
-                                    println!("  Docker: {}", image);
-                                }
-                                if let Some(mech) = config.get("mechanism_id") {
-                                    println!("  Mechanism: {}", mech);
-                                }
-                                if let Some(weight) = config.get("emission_weight") {
-                                    println!(
-                                        "  Weight: {:.2}%",
-                                        weight.as_f64().unwrap_or(0.0) * 100.0
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-
-                println!("\n=== Challenge Weights ===");
-                if let Some(weights) = state.get("challenge_weights") {
-                    if let Some(obj) = weights.as_object() {
-                        if obj.is_empty() {
-                            println!("No weight allocations set.");
-                        } else {
-                            for (id, alloc) in obj {
-                                println!("\nChallenge: {}", id);
-                                if let Some(mech) = alloc.get("mechanism_id") {
-                                    println!("  Mechanism: {}", mech);
-                                }
-                                if let Some(ratio) = alloc.get("weight_ratio") {
-                                    println!(
-                                        "  Ratio: {:.2}%",
-                                        ratio.as_f64().unwrap_or(0.0) * 100.0
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            return Ok(());
-        }
-
-        Commands::ListMechanisms => {
-            let client = reqwest::Client::new();
-            let rpc_url = format!("{}/rpc", args.rpc.trim_end_matches('/'));
-
-            let response = client
-                .post(&rpc_url)
-                .json(&serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "chain_getState",
-                    "params": [],
-                    "id": 1
-                }))
-                .send()
-                .await?;
-
-            let result: serde_json::Value = response.json().await?;
-
-            if let Some(error) = result.get("error") {
-                eprintln!("RPC Error: {}", error);
-                return Ok(());
-            }
-
-            if let Some(state) = result.get("result") {
-                println!("=== Mechanism Configs ===");
-                if let Some(configs) = state.get("mechanism_configs") {
-                    if let Some(obj) = configs.as_object() {
-                        if obj.is_empty() {
-                            println!("No mechanism configs set (using defaults).");
-                        } else {
-                            for (id, config) in obj {
-                                println!("\nMechanism: {}", id);
-                                if let Some(burn) = config.get("base_burn_rate") {
-                                    println!(
-                                        "  Burn Rate: {:.2}%",
-                                        burn.as_f64().unwrap_or(0.0) * 100.0
-                                    );
-                                }
-                                if let Some(cap) = config.get("max_weight_cap") {
-                                    println!(
-                                        "  Max Cap: {:.2}%",
-                                        cap.as_f64().unwrap_or(0.5) * 100.0
-                                    );
-                                }
-                                if let Some(equal) = config.get("equal_distribution") {
-                                    println!("  Equal Distribution: {}", equal);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            return Ok(());
-        }
-
-        Commands::AddValidator { hotkey, stake } => {
-            let hk = Hotkey::from_hex(&hotkey).ok_or_else(|| anyhow::anyhow!("Invalid hotkey"))?;
-            let stake_raw = (stake * 1_000_000_000.0) as u64;
-            let info = ValidatorInfo::new(hk, Stake::new(stake_raw));
-            info!("Adding validator: {} with {} TAO", hotkey, stake);
-            SudoAction::AddValidator { info }
-        }
-
-        Commands::RemoveValidator { hotkey } => {
-            let hk = Hotkey::from_hex(&hotkey).ok_or_else(|| anyhow::anyhow!("Invalid hotkey"))?;
-            info!("Removing validator: {}", hotkey);
-            SudoAction::RemoveValidator { hotkey: hk }
-        }
-
-        Commands::UpdateConfig {
-            min_stake,
-            threshold,
-            block_time,
-        } => {
-            let mut config = NetworkConfig::default();
-            if let Some(s) = min_stake {
-                config.min_stake = Stake::new((s * 1_000_000_000.0) as u64);
-            }
-            if let Some(t) = threshold {
-                config.consensus_threshold = t;
-            }
-            if let Some(bt) = block_time {
-                config.block_time_ms = bt;
-            }
-            info!("Updating network configuration");
-            SudoAction::UpdateConfig { config }
-        }
-
-        Commands::Pause { reason } => {
-            info!("Pausing network: {}", reason);
-            SudoAction::EmergencyPause { reason }
-        }
-
-        Commands::Resume => {
-            info!("Resuming network");
-            SudoAction::Resume
-        }
-
-        Commands::Status => {
-            let client = reqwest::Client::new();
-            let rpc_url = format!("{}/rpc", args.rpc.trim_end_matches('/'));
-
-            println!("=== Network Status ===");
-            println!("RPC: {}", args.rpc);
-
-            let health_response = client
-                .post(&rpc_url)
-                .json(&serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "system_health",
-                    "params": [],
-                    "id": 1
-                }))
-                .send()
-                .await;
-
-            match health_response {
-                Ok(resp) => {
-                    if let Ok(result) = resp.json::<serde_json::Value>().await {
-                        if let Some(health) = result.get("result") {
-                            println!("\nHealth:");
-                            if let Some(peers) = health.get("peers") {
-                                println!("  Peers: {}", peers);
-                            }
-                            if let Some(syncing) = health.get("isSyncing") {
-                                println!("  Syncing: {}", syncing);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to connect to RPC: {}", e);
-                    return Ok(());
-                }
-            }
-
-            let state_response = client
-                .post(&rpc_url)
-                .json(&serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "chain_getState",
-                    "params": [],
-                    "id": 2
-                }))
-                .send()
-                .await?;
-
-            let state_result: serde_json::Value = state_response.json().await?;
-
-            if let Some(state) = state_result.get("result") {
-                println!("\nChain State:");
-                if let Some(block) = state.get("block_height") {
-                    println!("  Block Height: {}", block);
-                }
-                if let Some(epoch) = state.get("epoch") {
-                    println!("  Epoch: {}", epoch);
-                }
-                if let Some(validators) = state.get("validators") {
-                    if let Some(obj) = validators.as_object() {
-                        println!("  Validators: {}", obj.len());
-                    }
-                }
-                if let Some(configs) = state.get("challenge_configs") {
-                    if let Some(obj) = configs.as_object() {
-                        println!("  Challenges: {}", obj.len());
-                    }
-                }
-                if let Some(mechs) = state.get("mechanism_configs") {
-                    if let Some(obj) = mechs.as_object() {
-                        println!("  Mechanisms Configured: {}", obj.len());
-                    }
-                }
-            }
-
-            return Ok(());
-        }
-    };
-
-    // Create signed messages for the sudo action
-    info!("Creating signed sudo action...");
-    let proposal_id = consensus.propose_sudo(action).await?;
-    info!("Proposal created: {:?}", proposal_id);
-
-    // Collect all messages to broadcast
-    let mut messages_to_send: Vec<SignedNetworkMessage> = Vec::new();
+    let mut messages: Vec<SignedNetworkMessage> = Vec::new();
     while let Ok(msg) = msg_rx.try_recv() {
-        messages_to_send.push(msg);
+        messages.push(msg);
     }
 
-    if messages_to_send.is_empty() {
-        eprintln!("No messages generated - action may have failed");
+    if messages.is_empty() {
+        pb.finish_with_message("No messages generated".red().to_string());
         return Ok(());
     }
 
-    // Submit each message via RPC
-    info!(
-        "Submitting {} messages via RPC to {}...",
-        messages_to_send.len(),
-        args.rpc
-    );
-    let client = reqwest::Client::new();
+    pb.set_message("Submitting to network...");
 
-    for msg in &messages_to_send {
+    let client = reqwest::Client::new();
+    let url = format!("{}/rpc", rpc_url.trim_end_matches('/'));
+
+    for msg in &messages {
         let serialized = bincode::serialize(&msg)?;
         let hex_encoded = hex::encode(&serialized);
 
-        let rpc_url = if args.rpc.ends_with("/rpc") {
-            args.rpc.clone()
-        } else {
-            format!("{}/rpc", args.rpc.trim_end_matches('/'))
-        };
-
         let response = client
-            .post(&rpc_url)
-            .header("Content-Type", "application/json")
+            .post(&url)
             .json(&serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "sudo_submit",
-                "params": {
-                    "signedMessage": hex_encoded
-                },
+                "params": { "signedMessage": hex_encoded },
                 "id": 1
             }))
             .send()
@@ -740,15 +603,646 @@ async fn main() -> Result<()> {
         let result: serde_json::Value = response.json().await?;
 
         if let Some(error) = result.get("error") {
-            eprintln!("RPC Error: {}", error);
-            return Ok(());
-        }
-
-        if let Some(res) = result.get("result") {
-            info!("Message submitted: {:?}", res);
+            pb.finish_with_message(format!("{} {}", "Error:".red(), error));
+            anyhow::bail!("RPC Error: {}", error);
         }
     }
 
-    info!("Action submitted successfully via RPC!");
+    pb.finish_with_message(format!("{} Action submitted successfully!", "✓".green()));
+    Ok(())
+}
+
+// ==================== Interactive Functions ====================
+
+fn get_keypair(secret: &Option<String>) -> Result<Keypair> {
+    let secret = match secret {
+        Some(s) => s.clone(),
+        None => Input::with_theme(&ColorfulTheme::default())
+            .with_prompt("Enter secret key or mnemonic")
+            .interact_text()?,
+    };
+
+    let secret = secret.trim();
+    let hex_str = secret.strip_prefix("0x").unwrap_or(secret);
+
+    if hex_str.len() == 64 {
+        if let Ok(bytes) = hex::decode(hex_str) {
+            if bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                return Ok(Keypair::from_seed(&arr)?);
+            }
+        }
+    }
+
+    Ok(Keypair::from_mnemonic(secret)?)
+}
+
+async fn interactive_add_challenge(rpc_url: &str, keypair: &Keypair) -> Result<()> {
+    print_section("Add New Challenge");
+
+    let name: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Challenge name")
+        .interact_text()?;
+
+    let docker_image: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Docker image (e.g., ghcr.io/org/image:tag)")
+        .interact_text()?;
+
+    let mechanism_id: u8 = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Mechanism ID")
+        .default(0)
+        .interact_text()?;
+
+    let emission_weight: f64 = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Emission weight (0.0-1.0)")
+        .default(1.0)
+        .interact_text()?;
+
+    let timeout: u64 = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Timeout (seconds)")
+        .default(3600)
+        .interact_text()?;
+
+    let cpu_cores: f64 = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("CPU cores")
+        .default(2.0)
+        .interact_text()?;
+
+    let memory_mb: u64 = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Memory (MB)")
+        .default(4096)
+        .interact_text()?;
+
+    let gpu_required = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt("Requires GPU?")
+        .default(false)
+        .interact()?;
+
+    println!("\n{}", "Challenge Configuration:".bright_yellow());
+    println!("  Name: {}", name.green());
+    println!("  Docker: {}", docker_image.cyan());
+    println!("  Mechanism: {}", mechanism_id.to_string().cyan());
+    println!("  Weight: {:.0}%", emission_weight * 100.0);
+    println!(
+        "  Resources: {}cpu / {}MB{}",
+        cpu_cores,
+        memory_mb,
+        if gpu_required { " / GPU" } else { "" }
+    );
+
+    if !Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt("Submit this challenge?")
+        .default(true)
+        .interact()?
+    {
+        println!("{}", "Cancelled.".yellow());
+        return Ok(());
+    }
+
+    let config = ChallengeContainerConfig {
+        challenge_id: ChallengeId::new(),
+        name,
+        docker_image,
+        mechanism_id,
+        emission_weight,
+        timeout_secs: timeout,
+        cpu_cores,
+        memory_mb,
+        gpu_required,
+    };
+
+    submit_action(rpc_url, keypair, SudoAction::AddChallenge { config }).await
+}
+
+async fn interactive_edit_challenge(
+    rpc_url: &str,
+    keypair: &Keypair,
+    state: &ChainStateData,
+    challenge_id: Option<String>,
+) -> Result<()> {
+    if state.challenges.is_empty() {
+        println!("{}", "No challenges to edit.".yellow());
+        return Ok(());
+    }
+
+    let challenge = if let Some(id) = challenge_id {
+        state
+            .challenges
+            .iter()
+            .find(|c| c.id.starts_with(&id))
+            .ok_or_else(|| anyhow::anyhow!("Challenge not found: {}", id))?
+    } else {
+        let options: Vec<String> = state
+            .challenges
+            .iter()
+            .map(|c| format!("{} ({})", c.name, &c.id[..8]))
+            .collect();
+
+        let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+            .with_prompt("Select challenge to edit")
+            .items(&options)
+            .interact()?;
+
+        &state.challenges[selection]
+    };
+
+    print_section(&format!("Edit Challenge: {}", challenge.name));
+
+    let edit_options = vec![
+        "Docker Image",
+        "Emission Weight",
+        "Timeout",
+        "CPU Cores",
+        "Memory",
+        "GPU Required",
+        "Done (submit changes)",
+        "Cancel",
+    ];
+
+    let mut config = ChallengeContainerConfig {
+        challenge_id: ChallengeId(uuid::Uuid::parse_str(&challenge.id)?),
+        name: challenge.name.clone(),
+        docker_image: challenge.docker_image.clone(),
+        mechanism_id: challenge.mechanism_id,
+        emission_weight: challenge.emission_weight,
+        timeout_secs: challenge.timeout_secs,
+        cpu_cores: challenge.cpu_cores,
+        memory_mb: challenge.memory_mb,
+        gpu_required: challenge.gpu_required,
+    };
+
+    loop {
+        println!("\n{}", "Current values:".bright_white());
+        println!("  Docker: {}", config.docker_image.cyan());
+        println!("  Weight: {:.0}%", config.emission_weight * 100.0);
+        println!("  Timeout: {}s", config.timeout_secs);
+        println!("  CPU: {}", config.cpu_cores);
+        println!("  Memory: {}MB", config.memory_mb);
+        println!("  GPU: {}", if config.gpu_required { "Yes" } else { "No" });
+
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("What to edit?")
+            .items(&edit_options)
+            .interact()?;
+
+        match selection {
+            0 => {
+                config.docker_image = Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("New Docker image")
+                    .default(config.docker_image.clone())
+                    .interact_text()?;
+            }
+            1 => {
+                config.emission_weight = Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Emission weight (0.0-1.0)")
+                    .default(config.emission_weight)
+                    .interact_text()?;
+            }
+            2 => {
+                config.timeout_secs = Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Timeout (seconds)")
+                    .default(config.timeout_secs)
+                    .interact_text()?;
+            }
+            3 => {
+                config.cpu_cores = Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("CPU cores")
+                    .default(config.cpu_cores)
+                    .interact_text()?;
+            }
+            4 => {
+                config.memory_mb = Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Memory (MB)")
+                    .default(config.memory_mb)
+                    .interact_text()?;
+            }
+            5 => {
+                config.gpu_required = Confirm::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Requires GPU?")
+                    .default(config.gpu_required)
+                    .interact()?;
+            }
+            6 => {
+                // Submit
+                return submit_action(rpc_url, keypair, SudoAction::UpdateChallenge { config })
+                    .await;
+            }
+            7 => {
+                println!("{}", "Cancelled.".yellow());
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn interactive_remove_challenge(
+    rpc_url: &str,
+    keypair: &Keypair,
+    state: &ChainStateData,
+    challenge_id: Option<String>,
+) -> Result<()> {
+    if state.challenges.is_empty() {
+        println!("{}", "No challenges to remove.".yellow());
+        return Ok(());
+    }
+
+    let challenge = if let Some(id) = challenge_id {
+        state
+            .challenges
+            .iter()
+            .find(|c| c.id.starts_with(&id))
+            .ok_or_else(|| anyhow::anyhow!("Challenge not found: {}", id))?
+    } else {
+        let options: Vec<String> = state
+            .challenges
+            .iter()
+            .map(|c| format!("{} ({})", c.name, &c.id[..8]))
+            .collect();
+
+        let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+            .with_prompt("Select challenge to remove")
+            .items(&options)
+            .interact()?;
+
+        &state.challenges[selection]
+    };
+
+    println!("\n{} You are about to remove:", "Warning:".red().bold());
+    println!("  Name: {}", challenge.name.red());
+    println!("  ID: {}", challenge.id);
+
+    if !Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt("Are you sure?")
+        .default(false)
+        .interact()?
+    {
+        println!("{}", "Cancelled.".yellow());
+        return Ok(());
+    }
+
+    let id = ChallengeId(uuid::Uuid::parse_str(&challenge.id)?);
+    submit_action(rpc_url, keypair, SudoAction::RemoveChallenge { id }).await
+}
+
+async fn interactive_mode(rpc_url: &str, keypair: &Keypair) -> Result<()> {
+    let term = Term::stdout();
+
+    loop {
+        term.clear_screen()?;
+        print_banner();
+
+        let state = fetch_chain_state(rpc_url).await?;
+        display_status(&state);
+
+        println!();
+        let menu_options = vec![
+            "📋 List Challenges",
+            "➕ Add Challenge",
+            "✏️  Edit Challenge",
+            "🗑️  Remove Challenge",
+            "⚙️  Configure Mechanism",
+            "👥 List Validators",
+            "🔄 Refresh",
+            "🚪 Exit",
+        ];
+
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("What would you like to do?")
+            .items(&menu_options)
+            .default(0)
+            .interact()?;
+
+        match selection {
+            0 => {
+                print_section("Challenges");
+                display_challenges(&state.challenges);
+                println!("\n{}", "Press Enter to continue...".dimmed());
+                let _ = term.read_line();
+            }
+            1 => {
+                interactive_add_challenge(rpc_url, keypair).await?;
+                println!("\n{}", "Press Enter to continue...".dimmed());
+                let _ = term.read_line();
+            }
+            2 => {
+                interactive_edit_challenge(rpc_url, keypair, &state, None).await?;
+                println!("\n{}", "Press Enter to continue...".dimmed());
+                let _ = term.read_line();
+            }
+            3 => {
+                interactive_remove_challenge(rpc_url, keypair, &state, None).await?;
+                println!("\n{}", "Press Enter to continue...".dimmed());
+                let _ = term.read_line();
+            }
+            4 => {
+                print_section("Mechanisms");
+                display_mechanisms(&state.mechanisms);
+                println!("\n{}", "Mechanism editing coming soon...".dimmed());
+                let _ = term.read_line();
+            }
+            5 => {
+                print_section("Validators");
+                display_validators(&state.validators);
+                println!("\n{}", "Press Enter to continue...".dimmed());
+                let _ = term.read_line();
+            }
+            6 => continue,
+            7 => {
+                println!("{}", "Goodbye!".green());
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+// ==================== Main ====================
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    // Setup minimal logging unless quiet
+    if !args.quiet {
+        tracing_subscriber::fmt()
+            .with_env_filter("warn")
+            .with_target(false)
+            .init();
+    }
+
+    // Handle keygen separately
+    if matches!(args.command, Commands::Keygen) {
+        let keypair = Keypair::generate();
+        println!("{}", "Generated new sr25519 keypair:".green().bold());
+        println!(
+            "  {} {}",
+            "Hotkey:".bright_white(),
+            keypair.hotkey().to_hex().cyan()
+        );
+        println!(
+            "  {} {}",
+            "SS58:".bright_white(),
+            keypair.ss58_address().cyan()
+        );
+        println!(
+            "  {} {}",
+            "Seed:".bright_white(),
+            hex::encode(keypair.seed()).yellow()
+        );
+        println!();
+        println!("{}", "To use with csudo:".dimmed());
+        println!("  export SUDO_SECRET_KEY=\"your-mnemonic-or-seed\"");
+        return Ok(());
+    }
+
+    // For all other commands, we need the keypair
+    let keypair = get_keypair(&args.secret_key)?;
+
+    if !args.quiet {
+        println!(
+            "{} {}",
+            "Subnet Owner:".bright_white(),
+            keypair.ss58_address().cyan()
+        );
+    }
+
+    match args.command {
+        Commands::Keygen => unreachable!(),
+
+        Commands::List(list_cmd) => {
+            let state = fetch_chain_state(&args.rpc).await?;
+
+            match list_cmd {
+                ListCommands::Challenges => {
+                    print_section("Challenges");
+                    display_challenges(&state.challenges);
+                }
+                ListCommands::Mechanisms => {
+                    print_section("Mechanisms");
+                    display_mechanisms(&state.mechanisms);
+                }
+                ListCommands::Validators => {
+                    print_section("Validators");
+                    display_validators(&state.validators);
+                }
+                ListCommands::All => {
+                    display_status(&state);
+                    print_section("Challenges");
+                    display_challenges(&state.challenges);
+                    print_section("Mechanisms");
+                    display_mechanisms(&state.mechanisms);
+                    print_section("Validators");
+                    display_validators(&state.validators);
+                }
+            }
+        }
+
+        Commands::Add(add_cmd) => {
+            match add_cmd {
+                AddCommands::Challenge {
+                    name,
+                    docker_image,
+                    mechanism_id,
+                } => {
+                    if name.is_some() && docker_image.is_some() && mechanism_id.is_some() {
+                        // Non-interactive
+                        let config = ChallengeContainerConfig {
+                            challenge_id: ChallengeId::new(),
+                            name: name.unwrap(),
+                            docker_image: docker_image.unwrap(),
+                            mechanism_id: mechanism_id.unwrap(),
+                            emission_weight: 1.0,
+                            timeout_secs: 3600,
+                            cpu_cores: 2.0,
+                            memory_mb: 4096,
+                            gpu_required: false,
+                        };
+                        submit_action(&args.rpc, &keypair, SudoAction::AddChallenge { config })
+                            .await?;
+                    } else {
+                        interactive_add_challenge(&args.rpc, &keypair).await?;
+                    }
+                }
+                AddCommands::Validator { hotkey, stake } => {
+                    let hk = if let Some(h) = hotkey {
+                        h
+                    } else {
+                        Input::with_theme(&ColorfulTheme::default())
+                            .with_prompt("Validator hotkey (hex)")
+                            .interact_text()?
+                    };
+                    let stake_tao = stake.unwrap_or_else(|| {
+                        Input::with_theme(&ColorfulTheme::default())
+                            .with_prompt("Stake (TAO)")
+                            .default(10.0)
+                            .interact_text()
+                            .unwrap_or(10.0)
+                    });
+
+                    let hotkey =
+                        Hotkey::from_hex(&hk).ok_or_else(|| anyhow::anyhow!("Invalid hotkey"))?;
+                    let stake_raw = (stake_tao * 1_000_000_000.0) as u64;
+                    let info = ValidatorInfo::new(hotkey, Stake::new(stake_raw));
+                    submit_action(&args.rpc, &keypair, SudoAction::AddValidator { info }).await?;
+                }
+            }
+        }
+
+        Commands::Edit(edit_cmd) => {
+            let state = fetch_chain_state(&args.rpc).await?;
+            match edit_cmd {
+                EditCommands::Challenge { id } => {
+                    interactive_edit_challenge(&args.rpc, &keypair, &state, id).await?;
+                }
+                EditCommands::Mechanism { id: _ } => {
+                    println!("{}", "Mechanism editing coming soon...".yellow());
+                }
+            }
+        }
+
+        Commands::Remove(remove_cmd) => {
+            let state = fetch_chain_state(&args.rpc).await?;
+            match remove_cmd {
+                RemoveCommands::Challenge { id } => {
+                    interactive_remove_challenge(&args.rpc, &keypair, &state, id).await?;
+                }
+                RemoveCommands::Validator { hotkey } => {
+                    let hk = if let Some(h) = hotkey {
+                        h
+                    } else {
+                        let options: Vec<String> = state
+                            .validators
+                            .iter()
+                            .map(|v| format!("{} ({:.2} TAO)", &v.hotkey[..16], v.stake_tao))
+                            .collect();
+
+                        if options.is_empty() {
+                            println!("{}", "No validators to remove.".yellow());
+                            return Ok(());
+                        }
+
+                        let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+                            .with_prompt("Select validator to remove")
+                            .items(&options)
+                            .interact()?;
+
+                        state.validators[selection].hotkey.clone()
+                    };
+
+                    let hotkey =
+                        Hotkey::from_hex(&hk).ok_or_else(|| anyhow::anyhow!("Invalid hotkey"))?;
+                    submit_action(&args.rpc, &keypair, SudoAction::RemoveValidator { hotkey })
+                        .await?;
+                }
+            }
+        }
+
+        Commands::Set(set_cmd) => match set_cmd {
+            SetCommands::Weight {
+                challenge_id,
+                mechanism_id,
+                weight,
+            } => {
+                let state = fetch_chain_state(&args.rpc).await?;
+
+                let cid = if let Some(id) = challenge_id {
+                    id
+                } else {
+                    let options: Vec<String> = state
+                        .challenges
+                        .iter()
+                        .map(|c| format!("{} ({})", c.name, &c.id[..8]))
+                        .collect();
+
+                    let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+                        .with_prompt("Select challenge")
+                        .items(&options)
+                        .interact()?;
+
+                    state.challenges[selection].id.clone()
+                };
+
+                let mech_id = mechanism_id.unwrap_or_else(|| {
+                    Input::with_theme(&ColorfulTheme::default())
+                        .with_prompt("Mechanism ID")
+                        .default(0)
+                        .interact_text()
+                        .unwrap_or(0)
+                });
+
+                let weight_ratio = weight.unwrap_or_else(|| {
+                    Input::with_theme(&ColorfulTheme::default())
+                        .with_prompt("Weight ratio (0.0-1.0)")
+                        .default(1.0)
+                        .interact_text()
+                        .unwrap_or(1.0)
+                });
+
+                let challenge_id = ChallengeId(uuid::Uuid::parse_str(&cid)?);
+                submit_action(
+                    &args.rpc,
+                    &keypair,
+                    SudoAction::SetChallengeWeight {
+                        challenge_id,
+                        mechanism_id: mech_id,
+                        weight_ratio,
+                    },
+                )
+                .await?;
+            }
+            SetCommands::Version {
+                version,
+                docker_image,
+                mandatory,
+            } => {
+                submit_action(
+                    &args.rpc,
+                    &keypair,
+                    SudoAction::SetRequiredVersion {
+                        min_version: version.clone(),
+                        recommended_version: version,
+                        docker_image,
+                        mandatory,
+                        deadline_block: None,
+                        release_notes: None,
+                    },
+                )
+                .await?;
+            }
+        },
+
+        Commands::Status => {
+            let state = fetch_chain_state(&args.rpc).await?;
+            display_status(&state);
+            print_section("Challenges");
+            display_challenges(&state.challenges);
+        }
+
+        Commands::Interactive => {
+            interactive_mode(&args.rpc, &keypair).await?;
+        }
+
+        Commands::Emergency(cmd) => match cmd {
+            EmergencyCommands::Pause { reason } => {
+                println!("{} Pausing the network!", "⚠️ WARNING:".red().bold());
+                if Confirm::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Are you absolutely sure?")
+                    .default(false)
+                    .interact()?
+                {
+                    submit_action(&args.rpc, &keypair, SudoAction::EmergencyPause { reason })
+                        .await?;
+                }
+            }
+            EmergencyCommands::Resume => {
+                submit_action(&args.rpc, &keypair, SudoAction::Resume).await?;
+            }
+        },
+    }
+
     Ok(())
 }

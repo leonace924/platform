@@ -30,3 +30,10 @@ hex = { workspace = true }
 parking_lot = { workspace = true }
 uuid = { workspace = true }
 reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+
+# Beautiful CLI
+console = "0.15"
+dialoguer = { version = "0.11", features = ["fuzzy-select"] }
+indicatif = "0.17"
+colored = "2.1"
+comfy-table = "7.1"
