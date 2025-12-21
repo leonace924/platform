@@ -6,13 +6,17 @@
 //! - Evaluation routing
 //! - Hot-swap without core restart
 //!
-//! ## Backend Selection
+//! ## Backend Selection (Secure by Default)
 //!
-//! The orchestrator supports two backends:
-//! - **Direct Docker** (default): For local development and testing
-//! - **Secure Broker**: For production validators, uses Unix socket API
+//! The orchestrator uses the **secure broker by default** in production.
+//! Direct Docker is ONLY used when explicitly in development mode.
 //!
-//! Set `CONTAINER_BROKER_SOCKET=/var/run/platform/broker.sock` to use the secure broker.
+//! Priority order:
+//! 1. `DEVELOPMENT_MODE=true` -> Direct Docker (local dev only)
+//! 2. Broker socket exists -> Secure broker (production default)
+//! 3. No broker + not dev mode -> Fallback to Docker with warnings
+//!
+//! Default broker socket: `/var/run/platform/broker.sock`
 
 pub mod backend;
 pub mod config;
@@ -22,7 +26,8 @@ pub mod health;
 pub mod lifecycle;
 
 pub use backend::{
-    create_backend, is_secure_mode, ContainerBackend, DirectDockerBackend, SecureBackend,
+    create_backend, is_development_mode, is_secure_mode, ContainerBackend, DirectDockerBackend,
+    SecureBackend, DEFAULT_BROKER_SOCKET,
 };
 pub use config::*;
 pub use docker::*;

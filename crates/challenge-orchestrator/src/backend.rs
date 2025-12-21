@@ -1,18 +1,35 @@
 //! Container backend abstraction
 //!
 //! Provides a unified interface for container management that can use:
-//! - Direct Docker (for local development/testing)
-//! - SecureContainerClient via broker (for production validators)
+//! - SecureContainerClient via broker (DEFAULT for production validators)
+//! - Direct Docker (ONLY for local development when DEVELOPMENT_MODE=true)
 //!
-//! The backend is selected based on the CONTAINER_BROKER_SOCKET environment variable.
-//! If set, uses the secure broker. Otherwise, uses direct Docker.
+//! ## Backend Selection (Priority Order)
+//!
+//! 1. If `DEVELOPMENT_MODE=true` -> Direct Docker (local dev only)
+//! 2. If `CONTAINER_BROKER_SOCKET` is set -> Use that socket path
+//! 3. If default socket exists (`/var/run/platform/broker.sock`) -> Use broker
+//! 4. Otherwise -> Error (production requires broker)
+//!
+//! ## Security
+//!
+//! In production, challenges MUST run through the secure broker.
+//! The broker enforces:
+//! - Image whitelisting (only ghcr.io/platformnetwork/)
+//! - Non-privileged containers
+//! - Resource limits
+//! - No Docker socket access for challenges
 
 use crate::{ChallengeContainerConfig, ChallengeInstance, ContainerStatus};
 use async_trait::async_trait;
 use secure_container_runtime::{
     ContainerConfigBuilder, ContainerState, NetworkMode, SecureContainerClient,
 };
-use tracing::{info, warn};
+use std::path::Path;
+use tracing::{error, info, warn};
+
+/// Default broker socket path
+pub const DEFAULT_BROKER_SOCKET: &str = "/var/run/platform/broker.sock";
 
 /// Container backend trait for managing challenge containers
 #[async_trait]
@@ -60,12 +77,37 @@ impl SecureBackend {
         }
     }
 
-    /// Create from environment
+    /// Create from environment or default socket
     pub fn from_env() -> Option<Self> {
-        let socket = std::env::var("CONTAINER_BROKER_SOCKET").ok()?;
         let validator_id =
             std::env::var("VALIDATOR_HOTKEY").unwrap_or_else(|_| "unknown".to_string());
-        Some(Self::new(&socket, &validator_id))
+
+        // Priority 1: Explicit socket path from env
+        if let Ok(socket) = std::env::var("CONTAINER_BROKER_SOCKET") {
+            if Path::new(&socket).exists() {
+                info!(socket = %socket, "Using broker socket from environment");
+                return Some(Self::new(&socket, &validator_id));
+            }
+            warn!(socket = %socket, "Broker socket from env does not exist");
+        }
+
+        // Priority 2: Default socket path
+        if Path::new(DEFAULT_BROKER_SOCKET).exists() {
+            info!(socket = %DEFAULT_BROKER_SOCKET, "Using default broker socket");
+            return Some(Self::new(DEFAULT_BROKER_SOCKET, &validator_id));
+        }
+
+        None
+    }
+
+    /// Check if broker is available
+    pub fn is_available() -> bool {
+        if let Ok(socket) = std::env::var("CONTAINER_BROKER_SOCKET") {
+            if Path::new(&socket).exists() {
+                return true;
+            }
+        }
+        Path::new(DEFAULT_BROKER_SOCKET).exists()
     }
 }
 
@@ -254,20 +296,60 @@ impl ContainerBackend for DirectDockerBackend {
 }
 
 /// Create the appropriate backend based on environment
+///
+/// Priority order:
+/// 1. DEVELOPMENT_MODE=true -> Direct Docker (local dev only)
+/// 2. Broker socket available -> Secure broker (production default)
+/// 3. No broker + not dev mode -> Error (production requires broker)
 pub async fn create_backend() -> anyhow::Result<Box<dyn ContainerBackend>> {
-    // Check if broker socket is configured
+    // Check if explicitly in development mode
+    let dev_mode = std::env::var("DEVELOPMENT_MODE")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    if dev_mode {
+        info!("DEVELOPMENT_MODE=true: Using direct Docker (local development)");
+        let direct = DirectDockerBackend::new().await?;
+        return Ok(Box::new(direct));
+    }
+
+    // Try to use secure broker (default for production)
     if let Some(secure) = SecureBackend::from_env() {
-        info!("Using secure container broker");
+        info!("Using secure container broker (production mode)");
         return Ok(Box::new(secure));
     }
 
-    // Fall back to direct Docker
-    info!("Using direct Docker (local development mode)");
-    let direct = DirectDockerBackend::new().await?;
-    Ok(Box::new(direct))
+    // No broker available - try Docker as last resort but warn
+    warn!("Broker not available. Attempting Docker fallback...");
+    warn!("This should only happen in local development!");
+    warn!("Set DEVELOPMENT_MODE=true to suppress this warning, or start the broker.");
+
+    match DirectDockerBackend::new().await {
+        Ok(direct) => {
+            warn!("Using direct Docker - NOT RECOMMENDED FOR PRODUCTION");
+            Ok(Box::new(direct))
+        }
+        Err(e) => {
+            error!("Cannot connect to Docker: {}", e);
+            error!("For production: Start the container-broker service");
+            error!("For development: Set DEVELOPMENT_MODE=true and ensure Docker is running");
+            Err(anyhow::anyhow!(
+                "No container backend available. \
+                 Start broker at {} or set DEVELOPMENT_MODE=true for local Docker",
+                DEFAULT_BROKER_SOCKET
+            ))
+        }
+    }
 }
 
 /// Check if running in secure mode (broker available)
 pub fn is_secure_mode() -> bool {
-    std::env::var("CONTAINER_BROKER_SOCKET").is_ok()
+    SecureBackend::is_available()
+}
+
+/// Check if in development mode
+pub fn is_development_mode() -> bool {
+    std::env::var("DEVELOPMENT_MODE")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
 }
