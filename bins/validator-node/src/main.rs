@@ -21,7 +21,6 @@ use platform_core::{
 use platform_epoch::{EpochConfig, EpochPhase, EpochTransition};
 use platform_network::{
     NetworkEvent, NetworkNode, NetworkProtection, NodeConfig, ProtectionConfig, SyncResponse,
-    MIN_STAKE_RAO, MIN_STAKE_TAO,
 };
 use platform_rpc::{OrchestratorCommand, RpcConfig, RpcServer};
 use platform_storage::Storage;
@@ -96,6 +95,11 @@ struct Args {
     /// When connected to Bittensor, stake is read from the metagraph
     #[arg(long, default_value = "1000")]
     stake: f64,
+
+    /// Minimum stake required to participate as validator (in TAO)
+    /// Default: 1000 TAO. Set lower for testnets or new subnets
+    #[arg(long, env = "MIN_STAKE_TAO", default_value = "1000")]
+    min_stake: f64,
 
     // === Bittensor Options ===
     /// Bittensor network endpoint
@@ -326,9 +330,13 @@ async fn main() -> Result<()> {
         Arc::new(RwLock::new(state))
     };
 
+    // Calculate minimum stake in RAO from CLI argument
+    let min_stake_tao = args.min_stake;
+    let min_stake_rao = (args.min_stake * 1_000_000_000.0) as u64;
+
     // Initialize network protection (DDoS + stake validation)
     let protection_config = ProtectionConfig {
-        min_stake_rao: MIN_STAKE_RAO,       // 1000 TAO minimum
+        min_stake_rao,                      // Configurable minimum stake
         rate_limit: 100,                    // 100 msg/sec per peer
         max_connections_per_ip: 5,          // 5 connections max per IP
         blacklist_duration_secs: 3600,      // 1 hour blacklist
@@ -340,7 +348,7 @@ async fn main() -> Result<()> {
     let protection = Arc::new(NetworkProtection::new(protection_config));
     info!(
         "Network protection enabled: min_stake={} TAO, rate_limit={} msg/s",
-        MIN_STAKE_TAO, 100
+        min_stake_tao, 100
     );
 
     // Add ourselves as a validator
@@ -348,10 +356,10 @@ async fn main() -> Result<()> {
         let stake_raw = (args.stake * 1_000_000_000.0) as u64;
 
         // Validate our own stake meets minimum
-        if stake_raw < MIN_STAKE_RAO {
+        if stake_raw < min_stake_rao {
             warn!(
                 "WARNING: Own stake ({} TAO) is below minimum ({} TAO). You may be rejected by other validators.",
-                args.stake, MIN_STAKE_TAO
+                args.stake, min_stake_tao
             );
         }
 
@@ -438,7 +446,7 @@ async fn main() -> Result<()> {
             addr: rpc_addr.parse()?,
             netuid: args.netuid,
             name: format!("MiniChain-{}", args.netuid),
-            min_stake: MIN_STAKE_RAO,
+            min_stake: min_stake_rao,
             cors_enabled: args.rpc_cors,
         };
 
@@ -805,11 +813,15 @@ async fn main() -> Result<()> {
                                         let hotkey_bytes: &[u8; 32] = neuron.hotkey.as_ref();
                                         let hotkey = Hotkey(*hotkey_bytes);
 
-                                        // Get stake (convert from u128 to u64, saturating)
-                                        let stake_rao = neuron.stake.min(u64::MAX as u128) as u64;
+                                        // Get effective stake: alpha stake + root stake (TAO on root subnet)
+                                        // This matches how Bittensor calculates validator weight
+                                        let alpha_stake = neuron.stake;
+                                        let root_stake = neuron.root_stake;
+                                        let effective_stake = alpha_stake.saturating_add(root_stake);
+                                        let stake_rao = effective_stake.min(u64::MAX as u128) as u64;
 
                                         // Skip if below minimum stake
-                                        if stake_rao < MIN_STAKE_RAO {
+                                        if stake_rao < min_stake_rao {
                                             continue;
                                         }
 
@@ -832,7 +844,7 @@ async fn main() -> Result<()> {
                                     }
 
                                     info!("Metagraph sync complete: {} neurons, {} validators with sufficient stake (min {} TAO)", 
-                                        metagraph.n, added, MIN_STAKE_TAO);
+                                        metagraph.n, added, min_stake_tao);
                                     info!("Validator identity verification ready - will accept messages from {} known validators", 
                                         state.validators.len());
                                     sync_success = true;
@@ -1779,7 +1791,7 @@ async fn main() -> Result<()> {
                                 let has_sufficient_stake = {
                                     let state = chain_state_clone.read();
                                     if let Some(validator) = state.get_validator(signed.signer()) {
-                                        validator.stake.0 >= MIN_STAKE_RAO
+                                        validator.stake.0 >= min_stake_rao
                                     } else {
                                         // Unknown validator - check against cached stake or reject
                                         if let Some(validation) = protection.check_cached_stake(&signer_hex) {
@@ -1787,7 +1799,7 @@ async fn main() -> Result<()> {
                                         } else {
                                             warn!(
                                                 "Unknown validator {}: not in state and no cached stake. Min required: {} TAO",
-                                                &signer_hex[..16], MIN_STAKE_TAO
+                                                &signer_hex[..16], min_stake_tao
                                             );
                                             false
                                         }
@@ -1810,7 +1822,7 @@ async fn main() -> Result<()> {
                                     } else {
                                         warn!(
                                             "Rejected message from {} - insufficient stake (min {} TAO required)",
-                                            &signer_hex[..16], MIN_STAKE_TAO
+                                            &signer_hex[..16], min_stake_tao
                                         );
                                     }
                                 }
@@ -1972,6 +1984,7 @@ async fn main() -> Result<()> {
                         let endpoint = subtensor_endpoint.clone();
                         let chain_state_for_sync = chain_state.clone();
                         let protection_for_sync = protection.clone();
+                        let min_stake_for_sync = min_stake_rao;
 
                         tokio::spawn(async move {
                             match BittensorClient::new(&endpoint).await {
@@ -1985,9 +1998,13 @@ async fn main() -> Result<()> {
                                             for neuron in metagraph.neurons.values() {
                                                 let hotkey_bytes: &[u8; 32] = neuron.hotkey.as_ref();
                                                 let hotkey = Hotkey(*hotkey_bytes);
-                                                let stake_rao = neuron.stake.min(u64::MAX as u128) as u64;
+                                                // Get effective stake: alpha stake + root stake
+                                                let alpha_stake = neuron.stake;
+                                                let root_stake = neuron.root_stake;
+                                                let effective_stake = alpha_stake.saturating_add(root_stake);
+                                                let stake_rao = effective_stake.min(u64::MAX as u128) as u64;
 
-                                                if stake_rao < MIN_STAKE_RAO {
+                                                if stake_rao < min_stake_for_sync {
                                                     continue;
                                                 }
 

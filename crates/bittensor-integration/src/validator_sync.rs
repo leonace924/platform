@@ -116,8 +116,12 @@ impl ValidatorSync {
             let hotkey_bytes: &[u8; 32] = neuron.hotkey.as_ref();
             let hotkey = Hotkey(*hotkey_bytes);
 
-            // Get stake (convert from u128 to u64, saturating)
-            let stake = neuron.stake.min(u64::MAX as u128) as u64;
+            // Get effective stake: alpha stake + root stake (TAO on root subnet)
+            // This matches how Bittensor calculates validator weight
+            let alpha_stake = neuron.stake;
+            let root_stake = neuron.root_stake;
+            let effective_stake = alpha_stake.saturating_add(root_stake);
+            let stake = effective_stake.min(u64::MAX as u128) as u64;
 
             // Skip if below minimum stake
             if stake < self.min_stake {
