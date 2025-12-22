@@ -813,12 +813,20 @@ async fn main() -> Result<()> {
                                     let mut state = chain_state.write();
 
                                     // Debug: collect top stakes for logging
-                                    let mut top_stakes: Vec<(u64, u128, u128, u128)> = metagraph.neurons
+                                    let mut top_stakes: Vec<(u64, u128, u128, u128)> = metagraph
+                                        .neurons
                                         .iter()
-                                        .map(|(uid, n)| (*uid, n.stake, n.root_stake, n.stake.saturating_add(n.root_stake)))
+                                        .map(|(uid, n)| {
+                                            (
+                                                *uid,
+                                                n.stake,
+                                                n.root_stake,
+                                                n.stake.saturating_add(n.root_stake),
+                                            )
+                                        })
                                         .collect();
                                     top_stakes.sort_by(|a, b| b.3.cmp(&a.3));
-                                    
+
                                     info!("Top 10 neurons by effective stake:");
                                     for (uid, alpha, root, total) in top_stakes.iter().take(10) {
                                         info!("  UID {}: alpha={:.2} TAO, root={:.2} TAO, total={:.2} TAO",
@@ -838,8 +846,10 @@ async fn main() -> Result<()> {
                                         // This matches how Bittensor calculates validator weight
                                         let alpha_stake = neuron.stake;
                                         let root_stake = neuron.root_stake;
-                                        let effective_stake = alpha_stake.saturating_add(root_stake);
-                                        let stake_rao = effective_stake.min(u64::MAX as u128) as u64;
+                                        let effective_stake =
+                                            alpha_stake.saturating_add(root_stake);
+                                        let stake_rao =
+                                            effective_stake.min(u64::MAX as u128) as u64;
 
                                         // Skip if below minimum stake
                                         if stake_rao < min_stake_rao {

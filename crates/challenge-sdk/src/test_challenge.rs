@@ -95,15 +95,17 @@ impl Challenge for SimpleTestChallenge {
             return Ok(vec![]);
         }
 
-        // Convert scores to weights using softmax-like normalization
+        // Convert scores to weights
+        // Note: In real challenges, agent_hash would be mapped to miner hotkey
+        // Here we use agent_hash as hotkey for testing
         let scores: Vec<(String, f64)> = results
             .iter()
             .map(|r| (r.agent_hash.clone(), r.score))
             .collect();
 
-        let weights = crate::weights::scores_to_weights(&scores, 1.0);
+        let weights = crate::weights::scores_to_weights(&scores);
 
-        ctx.info(&format!("Calculated weights for {} agents", weights.len()));
+        ctx.info(&format!("Calculated weights for {} miners", weights.len()));
 
         Ok(weights)
     }

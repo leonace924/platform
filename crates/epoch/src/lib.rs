@@ -145,10 +145,11 @@ pub struct EmissionDistribution {
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
-/// Emission for a single agent
+/// Emission for a single miner
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentEmission {
-    pub agent_hash: String,
+    /// Miner hotkey (SS58 address)
+    pub hotkey: String,
     pub weight: f64,
     pub emission: u64,
     pub challenge_id: ChallengeId,

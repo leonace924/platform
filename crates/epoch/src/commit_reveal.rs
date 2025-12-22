@@ -141,17 +141,13 @@ impl CommitRevealState {
             });
         }
 
-        // Aggregate weights
-        let mut aggregated = weights::aggregate_weights(submissions, min_validators)
-            .map_err(|e| CommitRevealError::AggregationFailed(e.to_string()))?;
-
-        // Apply smoothing
-        if smoothing > 0.0 {
-            aggregated = weights::smooth_weights(aggregated, smoothing);
-        }
-
-        // Normalize
-        aggregated = weights::normalize_weights(aggregated);
+        // All validators read from shared chain DB, so submissions should be identical
+        // Just take the first one and normalize
+        let aggregated = submissions
+            .into_iter()
+            .next()
+            .map(|w| weights::normalize_weights(w))
+            .unwrap_or_default();
 
         let participating: Vec<Hotkey> = self.reveals.keys().cloned().collect();
         let mut excluded = self.missing_reveals.clone();
@@ -171,7 +167,7 @@ impl CommitRevealState {
             weights: aggregated,
             participating_validators: participating,
             excluded_validators: excluded,
-            smoothing_applied: smoothing,
+            smoothing_applied: 0.0,
             finalized_at: chrono::Utc::now(),
         })
     }

@@ -73,14 +73,14 @@ impl WeightAggregator {
                 challenge_emission
             );
 
-            // Distribute to agents based on weights
+            // Distribute to miners based on weights
             for weight in weights {
-                let agent_emission = (challenge_emission as f64 * weight.weight) as u64;
+                let miner_emission = (challenge_emission as f64 * weight.weight) as u64;
 
                 distributions.push(AgentEmission {
-                    agent_hash: weight.agent_hash.clone(),
+                    hotkey: weight.hotkey.clone(),
                     weight: weight.weight,
-                    emission: agent_emission,
+                    emission: miner_emission,
                     challenge_id: challenge.id,
                 });
             }
@@ -104,20 +104,17 @@ impl WeightAggregator {
         }
     }
 
-    /// Merge emissions for same agent across multiple challenges
+    /// Merge emissions for same miner across multiple challenges
     fn merge_agent_emissions(&self, distributions: Vec<AgentEmission>) -> Vec<AgentEmission> {
-        let mut by_agent: HashMap<String, Vec<AgentEmission>> = HashMap::new();
+        let mut by_miner: HashMap<String, Vec<AgentEmission>> = HashMap::new();
 
         for dist in distributions {
-            by_agent
-                .entry(dist.agent_hash.clone())
-                .or_default()
-                .push(dist);
+            by_miner.entry(dist.hotkey.clone()).or_default().push(dist);
         }
 
-        by_agent
+        by_miner
             .into_iter()
-            .map(|(agent_hash, emissions)| {
+            .map(|(hotkey, emissions)| {
                 let total_emission: u64 = emissions.iter().map(|e| e.emission).sum();
                 let total_weight: f64 = emissions.iter().map(|e| e.weight).sum();
 
@@ -128,7 +125,7 @@ impl WeightAggregator {
                     .unwrap_or_else(ChallengeId::new);
 
                 AgentEmission {
-                    agent_hash,
+                    hotkey,
                     weight: total_weight / emissions.len() as f64,
                     emission: total_emission,
                     challenge_id,

@@ -222,33 +222,25 @@ impl EvaluationResult {
     }
 }
 
-/// Weight assignment for an agent
+/// Weight assignment for a miner
+///
+/// The `hotkey` field is the SS58 address of the miner who should receive this weight.
+/// This is looked up in the metagraph to find the corresponding UID for Bittensor submission.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WeightAssignment {
-    pub agent_hash: String,
+    /// Miner hotkey (SS58 address) - used to look up UID in metagraph
+    pub hotkey: String,
+    /// Weight for this miner (0.0 - 1.0)
     pub weight: f64,
-    pub confidence: f64,
-    pub reason: Option<String>,
 }
 
 impl WeightAssignment {
-    pub fn new(agent_hash: String, weight: f64) -> Self {
+    /// Create a weight assignment for a miner hotkey
+    pub fn new(hotkey: String, weight: f64) -> Self {
         Self {
-            agent_hash,
+            hotkey,
             weight: weight.clamp(0.0, 1.0),
-            confidence: 1.0,
-            reason: None,
         }
-    }
-
-    pub fn with_confidence(mut self, confidence: f64) -> Self {
-        self.confidence = confidence.clamp(0.0, 1.0);
-        self
-    }
-
-    pub fn with_reason(mut self, reason: String) -> Self {
-        self.reason = Some(reason);
-        self
     }
 }
 
@@ -363,28 +355,23 @@ mod tests {
 
     #[test]
     fn test_weight_assignment() {
-        let wa = WeightAssignment::new("agent".to_string(), 0.7);
+        let wa = WeightAssignment::new(
+            "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY".to_string(),
+            0.7,
+        );
+        assert_eq!(
+            wa.hotkey,
+            "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+        );
         assert_eq!(wa.weight, 0.7);
-        assert_eq!(wa.confidence, 1.0);
-        assert!(wa.reason.is_none());
-    }
-
-    #[test]
-    fn test_weight_assignment_builders() {
-        let wa = WeightAssignment::new("agent".to_string(), 0.8)
-            .with_confidence(0.9)
-            .with_reason("high performance".to_string());
-
-        assert_eq!(wa.confidence, 0.9);
-        assert_eq!(wa.reason, Some("high performance".to_string()));
     }
 
     #[test]
     fn test_weight_assignment_clamping() {
-        let wa1 = WeightAssignment::new("a".to_string(), 2.0);
+        let wa1 = WeightAssignment::new("hotkey1".to_string(), 2.0);
         assert_eq!(wa1.weight, 1.0);
 
-        let wa2 = WeightAssignment::new("a".to_string(), -1.0);
+        let wa2 = WeightAssignment::new("hotkey2".to_string(), -1.0);
         assert_eq!(wa2.weight, 0.0);
     }
 

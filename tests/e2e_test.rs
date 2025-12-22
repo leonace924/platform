@@ -184,41 +184,34 @@ async fn test_e2e_multi_validator_state() {
 /// Test weight calculation and normalization
 #[tokio::test]
 async fn test_e2e_weight_calculation() {
-    use platform_challenge_sdk::weights::{normalize_weights, scores_to_weights, smooth_weights};
+    use platform_challenge_sdk::weights::scores_to_weights;
 
-    // Simulate evaluation scores
+    // Simulate evaluation scores (hotkey -> score)
     let scores = vec![
-        ("agent_1".to_string(), 0.9),
-        ("agent_2".to_string(), 0.7),
-        ("agent_3".to_string(), 0.5),
-        ("agent_4".to_string(), 0.3),
-        ("agent_5".to_string(), 0.1),
+        (
+            "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY".to_string(),
+            0.9,
+        ),
+        (
+            "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty".to_string(),
+            0.7,
+        ),
+        (
+            "5FLSigC9HGRKVhB9FiEo4Y3koPsNmBmLJbpXg2mp1hXcS59Y".to_string(),
+            0.5,
+        ),
     ];
 
-    // Convert to weights
-    let weights = scores_to_weights(&scores, 1.0);
-
-    // Normalize
-    let normalized = normalize_weights(weights);
+    // Convert to weights (scores_to_weights already normalizes)
+    let weights = scores_to_weights(&scores);
 
     // Verify sum is ~1.0
-    let sum: f64 = normalized.iter().map(|w| w.weight).sum();
+    let sum: f64 = weights.iter().map(|w| w.weight).sum();
     assert!((sum - 1.0).abs() < 0.01, "Weights should sum to 1.0");
 
-    // Apply smoothing
-    let smoothed = smooth_weights(normalized.clone(), 0.2);
-
-    // Verify smoothed weights are less extreme
-    assert!(smoothed[0].weight < normalized[0].weight + 0.1);
-
     println!("=== Weight Calculation ===");
-    for (i, (n, s)) in normalized.iter().zip(smoothed.iter()).enumerate() {
-        println!(
-            "Agent {}: normalized={:.4}, smoothed={:.4}",
-            i + 1,
-            n.weight,
-            s.weight
-        );
+    for w in &weights {
+        println!("Hotkey {}: weight={:.4}", &w.hotkey[..8], w.weight);
     }
 }
 

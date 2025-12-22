@@ -415,7 +415,7 @@ impl WeightSubmitter {
     /// Converts WeightAssignment to (UIDs, normalized u16 weights)
     fn prepare_weights(&self, weights: &[WeightAssignment]) -> Result<(Vec<u64>, Vec<u16>)> {
         // Get hotkeys from weights
-        let hotkeys: Vec<String> = weights.iter().map(|w| w.agent_hash.clone()).collect();
+        let hotkeys: Vec<String> = weights.iter().map(|w| w.hotkey.clone()).collect();
 
         // Lookup UIDs for hotkeys from cached metagraph
         let uid_map = self.client.get_uids_for_hotkeys(&hotkeys);
@@ -424,13 +424,13 @@ impl WeightSubmitter {
         let mut weight_values = Vec::new();
 
         for weight in weights {
-            if let Some((_, uid)) = uid_map.iter().find(|(h, _)| h == &weight.agent_hash) {
+            if let Some((_, uid)) = uid_map.iter().find(|(h, _)| h == &weight.hotkey) {
                 uids.push(*uid as u64);
                 // Convert 0-1 weight to u16 (0-65535)
                 let w_u16 = (weight.weight.clamp(0.0, 1.0) * 65535.0) as u16;
                 weight_values.push(w_u16);
             } else {
-                warn!("No UID found for hotkey: {}", weight.agent_hash);
+                warn!("No UID found for hotkey: {}", weight.hotkey);
             }
         }
 
@@ -1043,7 +1043,7 @@ impl MechanismWeightManager {
 
     /// Prepare weights for submission (convert hotkeys to UIDs)
     fn prepare_weights(&self, weights: &[WeightAssignment]) -> Result<(Vec<u64>, Vec<u16>)> {
-        let hotkeys: Vec<String> = weights.iter().map(|w| w.agent_hash.clone()).collect();
+        let hotkeys: Vec<String> = weights.iter().map(|w| w.hotkey.clone()).collect();
 
         let uid_map = self.client.get_uids_for_hotkeys(&hotkeys);
 
@@ -1051,12 +1051,12 @@ impl MechanismWeightManager {
         let mut weight_values = Vec::new();
 
         for weight in weights {
-            if let Some((_, uid)) = uid_map.iter().find(|(h, _)| h == &weight.agent_hash) {
+            if let Some((_, uid)) = uid_map.iter().find(|(h, _)| h == &weight.hotkey) {
                 uids.push(*uid as u64);
                 let w_u16 = (weight.weight.clamp(0.0, 1.0) * 65535.0) as u16;
                 weight_values.push(w_u16);
             } else {
-                warn!("No UID found for hotkey: {}", weight.agent_hash);
+                warn!("No UID found for hotkey: {}", weight.hotkey);
             }
         }
 

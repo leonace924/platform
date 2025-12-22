@@ -282,7 +282,10 @@ impl DockerClient {
         let container_name = format!(
             "challenge-{}-{}",
             config.name.to_lowercase().replace(' ', "-"),
-            validator_suffix.to_lowercase().replace("-", "").replace(" ", "")
+            validator_suffix
+                .to_lowercase()
+                .replace("-", "")
+                .replace(" ", "")
         );
 
         // Remove existing container if any
@@ -308,8 +311,8 @@ impl DockerClient {
             // Mount tasks directory both to internal path AND to host path for Docker-in-Docker
             binds: Some(vec![
                 "/var/run/docker.sock:/var/run/docker.sock:rw".to_string(),
-                "/tmp/platform-tasks:/app/data/tasks:rw".to_string(),  // Override internal tasks
-                "/tmp/platform-tasks:/tmp/platform-tasks:rw".to_string(),  // For DinD path mapping
+                "/tmp/platform-tasks:/app/data/tasks:rw".to_string(), // Override internal tasks
+                "/tmp/platform-tasks:/tmp/platform-tasks:rw".to_string(), // For DinD path mapping
             ]),
             ..Default::default()
         };

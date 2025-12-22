@@ -34,7 +34,7 @@ impl Default for WeightCalculatorConfig {
         Self {
             min_score_threshold: 0.0,
             temperature: 1.0,
-            use_softmax: false, // Use simple linear normalization
+            use_softmax: false,       // Use simple linear normalization
             max_weight_fraction: 1.0, // No cap - pure weights
             mechanism_id: 0,
         }
@@ -191,7 +191,7 @@ impl WeightCalculator {
     }
 
     /// Apply weight cap (DISABLED - pure pass-through)
-    /// 
+    ///
     /// NOTE: Weight caps have been removed for simpler, more transparent weight distribution.
     /// Challenges receive weights purely based on their emission percentage.
     /// Unused weight is sent to UID 0 (burn address).
@@ -387,9 +387,17 @@ mod tests {
         // Score 0.9 / 1.0 = 90% weight, Score 0.1 / 1.0 = 10% weight
         let uid1_weight = result.weights.iter().find(|w| w.uid == 1).unwrap();
         let uid2_weight = result.weights.iter().find(|w| w.uid == 2).unwrap();
-        
-        assert!(uid1_weight.normalized > 0.85, "UID 1 should get ~90% weight: {}", uid1_weight.normalized);
-        assert!(uid2_weight.normalized < 0.15, "UID 2 should get ~10% weight: {}", uid2_weight.normalized);
+
+        assert!(
+            uid1_weight.normalized > 0.85,
+            "UID 1 should get ~90% weight: {}",
+            uid1_weight.normalized
+        );
+        assert!(
+            uid2_weight.normalized < 0.15,
+            "UID 2 should get ~10% weight: {}",
+            uid2_weight.normalized
+        );
 
         // Verify weights still sum to 1.0
         let sum: f64 = result.weights.iter().map(|w| w.normalized).sum();

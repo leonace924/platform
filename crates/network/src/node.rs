@@ -231,7 +231,7 @@ impl NetworkNode {
         if self.bootstrap_peers.is_empty() {
             return; // No bootnode configured
         }
-        
+
         if !self.has_bootstrap_connection() {
             info!("Not connected to bootnode, retrying in 30s...");
             self.dial_bootstrap_peers();
@@ -337,7 +337,10 @@ impl NetworkNode {
             } => {
                 let is_bootstrap = self.bootstrap_peer_ids.contains(&peer_id);
                 if is_bootstrap {
-                    warn!("Failed to connect to bootnode {}: {} (will retry in 30s)", peer_id, error);
+                    warn!(
+                        "Failed to connect to bootnode {}: {} (will retry in 30s)",
+                        peer_id, error
+                    );
                 } else {
                     warn!("Failed to connect to {}: {}", peer_id, error);
                 }

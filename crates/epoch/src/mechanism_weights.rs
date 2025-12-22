@@ -11,7 +11,7 @@
 use parking_lot::RwLock;
 use platform_challenge_sdk::{ChallengeId, WeightAssignment};
 use std::collections::HashMap;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// UID 0 is the burn address - receives unused emission weight
 pub const BURN_UID: u16 = 0;
@@ -36,11 +36,15 @@ pub struct MechanismWeights {
     pub emission_weight: f64,
 }
 
+/// Hotkey to UID mapping from metagraph
+pub type HotkeyUidMap = HashMap<String, u16>;
+
 impl MechanismWeights {
     /// Create new MechanismWeights with emission-based distribution
-    /// 
+    ///
     /// - emission_weight: fraction of total emissions this challenge controls (0.0 - 1.0)
     /// - assignments: raw scores from challenge (will be scaled by emission_weight)
+    /// - hotkey_to_uid: mapping from hotkey (SS58) to UID from metagraph
     /// - Remaining weight goes to UID 0 (burn)
     pub fn new(
         mechanism_id: u8,
@@ -48,8 +52,27 @@ impl MechanismWeights {
         assignments: Vec<WeightAssignment>,
         emission_weight: f64,
     ) -> Self {
+        // No hotkey mapping - use placeholder UIDs
+        Self::with_hotkey_mapping(
+            mechanism_id,
+            challenge_id,
+            assignments,
+            emission_weight,
+            &HashMap::new(),
+        )
+    }
+
+    /// Create with hotkey to UID mapping from metagraph
+    pub fn with_hotkey_mapping(
+        mechanism_id: u8,
+        challenge_id: ChallengeId,
+        assignments: Vec<WeightAssignment>,
+        emission_weight: f64,
+        hotkey_to_uid: &HotkeyUidMap,
+    ) -> Self {
         let emission_weight = emission_weight.clamp(0.0, 1.0);
-        let (uids, weights) = Self::convert_to_bittensor_format(&assignments, emission_weight);
+        let (uids, weights) =
+            Self::convert_to_bittensor_format(&assignments, emission_weight, hotkey_to_uid);
         Self {
             mechanism_id,
             challenge_id,
@@ -61,13 +84,15 @@ impl MechanismWeights {
     }
 
     /// Convert WeightAssignment to Bittensor format with emission scaling
-    /// 
+    ///
     /// Example: emission_weight = 0.1 (10%)
-    /// - Challenge returns [Agent A: 0.6, Agent B: 0.4]
-    /// - After scaling: Agent A: 6%, Agent B: 4%, UID 0: 90%
+    /// - Challenge returns [Agent A (hotkey1): 0.6, Agent B (hotkey2): 0.4]
+    /// - Look up UIDs from metagraph: hotkey1 -> UID 5, hotkey2 -> UID 12
+    /// - After scaling: UID 5: 6%, UID 12: 4%, UID 0: 90%
     fn convert_to_bittensor_format(
         assignments: &[WeightAssignment],
         emission_weight: f64,
+        hotkey_to_uid: &HotkeyUidMap,
     ) -> (Vec<u16>, Vec<u16>) {
         if assignments.is_empty() || emission_weight <= 0.0 {
             // No challenge weights - all to UID 0
@@ -83,16 +108,34 @@ impl MechanismWeights {
         let mut uids = Vec::with_capacity(assignments.len() + 1);
         let mut weights = Vec::with_capacity(assignments.len() + 1);
         let mut used_weight: u64 = 0;
+        let mut skipped_no_uid = 0;
 
         // Add challenge agent weights (scaled by emission_weight)
-        for (idx, assignment) in assignments.iter().enumerate() {
-            // TODO: Replace idx with actual UID mapping from agent_hash -> neuron UID
-            let uid = (idx + 1) as u16; // Start from 1, UID 0 is reserved for burn
-            
+        for assignment in assignments.iter() {
+            // Look up UID from hotkey via metagraph
+            let uid = if let Some(&uid) = hotkey_to_uid.get(&assignment.hotkey) {
+                uid
+            } else {
+                // Hotkey not found in metagraph - skip this assignment
+                debug!(
+                    "Hotkey {} not found in metagraph, skipping weight assignment",
+                    assignment.hotkey
+                );
+                skipped_no_uid += 1;
+                continue;
+            };
+
+            // Skip UID 0 as it's reserved for burn
+            if uid == BURN_UID {
+                debug!("Skipping UID 0 assignment (reserved for burn)");
+                continue;
+            }
+
             // Scale: (score / total) * emission_weight * MAX_WEIGHT
             let normalized_score = assignment.weight / total;
-            let scaled_weight = (normalized_score * emission_weight * MAX_WEIGHT as f64).round() as u16;
-            
+            let scaled_weight =
+                (normalized_score * emission_weight * MAX_WEIGHT as f64).round() as u16;
+
             if scaled_weight > 0 {
                 uids.push(uid);
                 weights.push(scaled_weight);
@@ -108,10 +151,15 @@ impl MechanismWeights {
         }
 
         info!(
-            "Weight distribution: {}% to {} agents, {}% to UID 0 (burn)",
+            "Weight distribution: {}% to {} agents, {}% to UID 0 (burn){}",
             (emission_weight * 100.0).round(),
-            assignments.len(),
-            ((burn_weight as f64 / MAX_WEIGHT as f64) * 100.0).round()
+            uids.len().saturating_sub(1), // Exclude UID 0 from count
+            ((burn_weight as f64 / MAX_WEIGHT as f64) * 100.0).round(),
+            if skipped_no_uid > 0 {
+                format!(", {} skipped (no UID)", skipped_no_uid)
+            } else {
+                String::new()
+            }
         );
 
         (uids, weights)
@@ -154,8 +202,9 @@ impl MechanismWeightManager {
     }
 
     /// Submit weights from a challenge
-    /// 
+    ///
     /// - emission_weight: fraction of total emissions this challenge controls (0.0 - 1.0)
+    /// - hotkey_to_uid: mapping from hotkey (SS58) to UID from metagraph
     /// - Remaining weight (1.0 - emission_weight) automatically goes to UID 0 (burn)
     pub fn submit_weights(
         &self,
@@ -164,17 +213,42 @@ impl MechanismWeightManager {
         weights: Vec<WeightAssignment>,
         emission_weight: f64,
     ) {
-        let mech_weights = MechanismWeights::new(mechanism_id, challenge_id, weights, emission_weight);
+        // No hotkey mapping - use fallback UIDs
+        self.submit_weights_with_metagraph(
+            challenge_id,
+            mechanism_id,
+            weights,
+            emission_weight,
+            &HashMap::new(),
+        )
+    }
+
+    /// Submit weights with hotkey to UID mapping from metagraph
+    pub fn submit_weights_with_metagraph(
+        &self,
+        challenge_id: ChallengeId,
+        mechanism_id: u8,
+        weights: Vec<WeightAssignment>,
+        emission_weight: f64,
+        hotkey_to_uid: &HotkeyUidMap,
+    ) {
+        let mech_weights = MechanismWeights::with_hotkey_mapping(
+            mechanism_id,
+            challenge_id,
+            weights,
+            emission_weight,
+            hotkey_to_uid,
+        );
         self.weights.write().insert(mechanism_id, mech_weights);
 
         info!(
-            "Submitted weights for mechanism {} from challenge {:?}: {} agents, {}% emission",
+            "Submitted weights for mechanism {} from challenge {:?}: {} UIDs, {}% emission",
             mechanism_id,
             challenge_id,
             self.weights
                 .read()
                 .get(&mechanism_id)
-                .map(|w| w.uids.len())
+                .map(|w| w.uids.len().saturating_sub(1)) // Exclude UID 0
                 .unwrap_or(0),
             (emission_weight * 100.0).round()
         );
@@ -385,14 +459,25 @@ mod tests {
     #[test]
     fn test_mechanism_weights_with_emission() {
         let assignments = vec![
-            WeightAssignment::new("agent1".to_string(), 0.6),
-            WeightAssignment::new("agent2".to_string(), 0.4),
+            WeightAssignment::new("hotkey1".to_string(), 0.6),
+            WeightAssignment::new("hotkey2".to_string(), 0.4),
         ];
 
-        // 10% emission weight - challenge controls 10% of total emissions
-        let mech_weights = MechanismWeights::new(1, ChallengeId::new(), assignments, 0.1);
+        // Create hotkey -> UID mapping
+        let mut hotkey_to_uid: HotkeyUidMap = HashMap::new();
+        hotkey_to_uid.insert("hotkey1".to_string(), 1);
+        hotkey_to_uid.insert("hotkey2".to_string(), 2);
 
-        // Should have 3 UIDs: UID 0 (burn) + 2 agents
+        // 10% emission weight - challenge controls 10% of total emissions
+        let mech_weights = MechanismWeights::with_hotkey_mapping(
+            1,
+            ChallengeId::new(),
+            assignments,
+            0.1,
+            &hotkey_to_uid,
+        );
+
+        // Should have 3 UIDs: UID 0 (burn) + 2 miners
         assert_eq!(mech_weights.uids.len(), 3);
         assert_eq!(mech_weights.weights.len(), 3);
 
@@ -401,30 +486,52 @@ mod tests {
 
         // Weights should sum to MAX_WEIGHT (65535)
         let sum: u32 = mech_weights.weights.iter().map(|w| *w as u32).sum();
-        assert!((65530..=65540).contains(&sum), "Sum should be ~65535, got {}", sum);
+        assert!(
+            (65530..=65540).contains(&sum),
+            "Sum should be ~65535, got {}",
+            sum
+        );
 
         // UID 0 should get ~90% (since emission_weight is 10%)
         let burn_weight = mech_weights.weights[0] as f64 / MAX_WEIGHT as f64;
-        assert!(burn_weight > 0.89 && burn_weight < 0.91, "Burn should be ~90%, got {}", burn_weight * 100.0);
+        assert!(
+            burn_weight > 0.89 && burn_weight < 0.91,
+            "Burn should be ~90%, got {}",
+            burn_weight * 100.0
+        );
     }
 
     #[test]
     fn test_mechanism_weights_full_emission() {
         let assignments = vec![
-            WeightAssignment::new("agent1".to_string(), 0.6),
-            WeightAssignment::new("agent2".to_string(), 0.4),
+            WeightAssignment::new("hotkey1".to_string(), 0.6),
+            WeightAssignment::new("hotkey2".to_string(), 0.4),
         ];
 
+        // Create hotkey -> UID mapping
+        let mut hotkey_to_uid: HotkeyUidMap = HashMap::new();
+        hotkey_to_uid.insert("hotkey1".to_string(), 1);
+        hotkey_to_uid.insert("hotkey2".to_string(), 2);
+
         // 100% emission weight - challenge controls all emissions
-        let mech_weights = MechanismWeights::new(1, ChallengeId::new(), assignments, 1.0);
+        let mech_weights = MechanismWeights::with_hotkey_mapping(
+            1,
+            ChallengeId::new(),
+            assignments,
+            1.0,
+            &hotkey_to_uid,
+        );
 
         // Should have 2 UIDs (no burn needed when emission is 100%)
-        // Actually burn_weight = 0 so it won't be added
         assert!(mech_weights.uids.len() >= 2);
 
         // Weights should sum to MAX_WEIGHT
         let sum: u32 = mech_weights.weights.iter().map(|w| *w as u32).sum();
-        assert!((65530..=65540).contains(&sum), "Sum should be ~65535, got {}", sum);
+        assert!(
+            (65530..=65540).contains(&sum),
+            "Sum should be ~65535, got {}",
+            sum
+        );
     }
 
     #[test]
