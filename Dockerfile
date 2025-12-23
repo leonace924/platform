@@ -1,11 +1,22 @@
 # ============================================================================
-# Platform Chain - Optimized Multi-stage Docker Build
+# Platform Chain - Optimized Multi-stage Docker Build with Dependency Caching
 # ============================================================================
 
-# Stage 1: Builder
-FROM rust:slim-trixie AS builder
-
+# Stage 1: Chef - prepare recipe for dependency caching
+FROM rust:slim-trixie AS chef
+RUN cargo install cargo-chef --locked
 WORKDIR /app
+
+# Stage 2: Planner - analyze dependencies
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY bins ./bins
+COPY tests ./tests
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Stage 3: Builder - build with cached dependencies
+FROM chef AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -16,19 +27,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy source code
+# Build dependencies first (this layer is cached if dependencies don't change)
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+
+# Copy source code and build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY bins ./bins
 COPY tests ./tests
 
-# Build release binaries
+# Build release binaries (only source changes trigger this)
 RUN cargo build --release --bin validator-node --bin csudo
 
 # Strip binaries for smaller size
 RUN strip /app/target/release/validator-node /app/target/release/csudo
 
-# Stage 2: Runtime - Minimal production image
+# Stage 4: Runtime - Minimal production image
 FROM debian:trixie-slim AS runtime
 
 # Install runtime dependencies
