@@ -301,13 +301,19 @@ impl DockerClient {
             }]),
         );
 
-        // Create persistent data directory for challenge state (survives restarts)
-        let challenge_data_dir = format!("/tmp/platform-challenges/{}/data", container_name);
-        if let Err(e) = std::fs::create_dir_all(&challenge_data_dir) {
-            warn!(
-                "Failed to create challenge data dir {}: {}",
-                challenge_data_dir, e
-            );
+        // Create named Docker volume for persistent challenge data (survives container recreation)
+        // Use container_name (includes validator suffix) so each validator has its own data
+        let volume_name = format!("{}-data", container_name);
+
+        // Create volume if it doesn't exist (Docker will auto-create on mount, but explicit is clearer)
+        let volume_opts = bollard::volume::CreateVolumeOptions {
+            name: volume_name.as_str(),
+            driver: "local",
+            ..Default::default()
+        };
+        if let Err(e) = self.docker.create_volume(volume_opts).await {
+            // Volume might already exist, which is fine
+            debug!("Volume creation result for {}: {:?}", volume_name, e);
         }
 
         // Build host config with resource limits
@@ -318,12 +324,12 @@ impl DockerClient {
             memory: Some((config.memory_mb * 1024 * 1024) as i64),
             // Mount Docker socket for challenge containers to run agent evaluations
             // Mount tasks directory both to internal path AND to host path for Docker-in-Docker
-            // Mount persistent data directory for challenge state (evaluation progress, etc.)
+            // Mount persistent Docker volume for challenge state (evaluation progress, etc.)
             binds: Some(vec![
                 "/var/run/docker.sock:/var/run/docker.sock:rw".to_string(),
                 "/tmp/platform-tasks:/app/data/tasks:rw".to_string(), // Override internal tasks
                 "/tmp/platform-tasks:/tmp/platform-tasks:rw".to_string(), // For DinD path mapping
-                format!("{}:/data:rw", challenge_data_dir),           // Persistent challenge state
+                format!("{}:/data:rw", volume_name),                  // Named volume for persistent state
             ]),
             ..Default::default()
         };
