@@ -1034,6 +1034,18 @@ async fn run_validator() -> Result<()> {
                                     let mut skipped_low_stake = 0;
                                     let mut add_failed = 0;
 
+                                    // Collect ALL hotkeys for registered_hotkeys (miners + validators)
+                                    let all_hotkeys: std::collections::HashSet<Hotkey> = metagraph
+                                        .neurons
+                                        .values()
+                                        .map(|n| {
+                                            let bytes: &[u8; 32] = n.hotkey.as_ref();
+                                            Hotkey(*bytes)
+                                        })
+                                        .collect();
+                                    state.registered_hotkeys = all_hotkeys;
+                                    info!("Registered {} hotkeys from metagraph (miners + validators)", state.registered_hotkeys.len());
+
                                     for neuron in metagraph.neurons.values() {
                                         // Convert AccountId32 hotkey to our Hotkey type
                                         let hotkey_bytes: &[u8; 32] = neuron.hotkey.as_ref();
@@ -2404,6 +2416,18 @@ async fn run_validator() -> Result<()> {
                                             let mut updated = 0;
                                             let mut state = chain_state_for_sync.write();
 
+                                            // Update ALL registered hotkeys (miners + validators)
+                                            let all_hotkeys: std::collections::HashSet<Hotkey> = metagraph
+                                                .neurons
+                                                .values()
+                                                .map(|n| {
+                                                    let bytes: &[u8; 32] = n.hotkey.as_ref();
+                                                    Hotkey(*bytes)
+                                                })
+                                                .collect();
+                                            let hotkey_count = all_hotkeys.len();
+                                            state.registered_hotkeys = all_hotkeys;
+
                                             for neuron in metagraph.neurons.values() {
                                                 let hotkey_bytes: &[u8; 32] = neuron.hotkey.as_ref();
                                                 let hotkey = Hotkey(*hotkey_bytes);
@@ -2433,10 +2457,8 @@ async fn run_validator() -> Result<()> {
                                                 }
                                             }
 
-                                            if added > 0 || updated > 0 {
-                                                info!("Metagraph periodic sync: {} added, {} updated (total: {} validators)",
-                                                    added, updated, state.validators.len());
-                                            }
+                                            info!("Metagraph periodic sync: {} added, {} updated (total: {} validators, {} registered hotkeys)",
+                                                added, updated, state.validators.len(), hotkey_count);
                                         }
                                         Err(e) => {
                                             warn!("Periodic metagraph sync failed: {}", e);
