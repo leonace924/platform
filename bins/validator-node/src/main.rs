@@ -1798,6 +1798,9 @@ async fn run_validator() -> Result<()> {
     let subtensor_endpoint = args.subtensor_endpoint.clone();
     let mut last_metagraph_sync = std::time::Instant::now();
     let metagraph_sync_interval = std::time::Duration::from_secs(600); // Sync metagraph every 10 minutes
+    let mut last_challenge_validator_sync = std::time::Instant::now();
+    let challenge_validator_sync_interval = std::time::Duration::from_secs(60); // Sync validators to challenges every minute
+    let endpoints_for_sync = challenge_endpoints.clone();
 
     // Fetch mechanism count from Bittensor and submit initial weights
     // This prevents vtrust penalty from not having set weights yet
@@ -2502,6 +2505,71 @@ async fn run_validator() -> Result<()> {
                                 }
                             }
                         });
+                    }
+
+                    // Periodic sync of validators to challenge containers
+                    if last_challenge_validator_sync.elapsed() >= challenge_validator_sync_interval {
+                        last_challenge_validator_sync = std::time::Instant::now();
+                        
+                        // Get current validators from chain state
+                        let validators: Vec<_> = chain_state
+                            .read()
+                            .validators
+                            .iter()
+                            .map(|(hotkey, info)| {
+                                serde_json::json!({
+                                    "hotkey": hotkey.to_hex(),
+                                    "stake": info.stake.0,
+                                    "endpoint": ""
+                                })
+                            })
+                            .collect();
+
+                        if !validators.is_empty() {
+                            // Get all known challenge endpoints
+                            let endpoints: Vec<(String, String)> = endpoints_for_sync
+                                .read()
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect();
+
+                            for (challenge_id, endpoint) in endpoints {
+                                let validators_clone = validators.clone();
+                                let challenge_id_clone = challenge_id.clone();
+                                tokio::spawn(async move {
+                                    let sync_url = format!("{}/p2p/validators", endpoint);
+                                    let client = reqwest::Client::new();
+                                    match client
+                                        .post(&sync_url)
+                                        .json(&serde_json::json!({ "validators": validators_clone }))
+                                        .timeout(std::time::Duration::from_secs(5))
+                                        .send()
+                                        .await
+                                    {
+                                        Ok(resp) if resp.status().is_success() => {
+                                            debug!(
+                                                "Periodic sync: {} validators to challenge '{}'",
+                                                validators_clone.len(),
+                                                challenge_id_clone
+                                            );
+                                        }
+                                        Ok(resp) => {
+                                            debug!(
+                                                "Periodic sync to '{}' failed: {}",
+                                                challenge_id_clone,
+                                                resp.status()
+                                            );
+                                        }
+                                        Err(e) => {
+                                            debug!(
+                                                "Periodic sync to '{}' failed: {}",
+                                                challenge_id_clone, e
+                                            );
+                                        }
+                                    }
+                                });
+                            }
+                        }
                     }
 
                     // Log protection stats periodically
