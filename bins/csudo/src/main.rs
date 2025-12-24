@@ -1149,6 +1149,7 @@ async fn interactive_mode(rpc_url: &str, keypair: &Keypair) -> Result<()> {
             "🗑️  Remove Challenge",
             "⚙️  Configure Mechanism",
             "👥 List Validators",
+            "📊 Monitor Health",
             "🔄 Refresh",
             "🚪 Exit",
         ];
@@ -1193,8 +1194,18 @@ async fn interactive_mode(rpc_url: &str, keypair: &Keypair) -> Result<()> {
                 println!("\n{}", "Press Enter to continue...".dimmed());
                 let _ = term.read_line();
             }
-            6 => continue,
-            7 => {
+            6 => {
+                // Monitor Health
+                print_section("Challenge Health");
+                match fetch_challenge_health(rpc_url).await {
+                    Ok(health) => display_health_summary(&health),
+                    Err(e) => println!("{} {}", "Error:".red(), e),
+                }
+                println!("\n{}", "Press Enter to continue...".dimmed());
+                let _ = term.read_line();
+            }
+            7 => continue,
+            8 => {
                 println!("{}", "Goodbye!".green());
                 break;
             }
