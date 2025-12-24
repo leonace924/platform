@@ -48,6 +48,116 @@ impl DockerClient {
         })
     }
 
+    /// Connect and auto-detect the network from the validator container
+    /// This ensures challenge containers are on the same network as the validator
+    pub async fn connect_auto_detect() -> anyhow::Result<Self> {
+        let docker = Docker::connect_with_local_defaults()?;
+        docker.ping().await?;
+        info!("Connected to Docker daemon");
+
+        // Try to detect the network from the current container
+        let network_name = Self::detect_validator_network_static(&docker).await
+            .unwrap_or_else(|e| {
+                warn!("Could not detect validator network: {}. Using default 'platform-network'", e);
+                "platform-network".to_string()
+            });
+
+        info!(network = %network_name, "Using network for challenge containers");
+
+        Ok(Self {
+            docker,
+            network_name,
+        })
+    }
+
+    /// Detect the network the validator container is running on
+    async fn detect_validator_network_static(docker: &Docker) -> anyhow::Result<String> {
+        // Get our container ID
+        let container_id = Self::get_container_id_static()?;
+        
+        // Inspect our container to find its networks
+        let inspect = docker.inspect_container(&container_id, None).await?;
+        
+        let networks = inspect
+            .network_settings
+            .as_ref()
+            .and_then(|ns| ns.networks.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("No network settings found"))?;
+
+        // Find a suitable network (prefer non-default networks)
+        // Priority: user-defined bridge > any bridge > host
+        let mut best_network: Option<String> = None;
+        
+        for (name, _settings) in networks {
+            // Skip host and none networks
+            if name == "host" || name == "none" {
+                continue;
+            }
+            // Skip the default bridge network (containers can't communicate by name on it)
+            if name == "bridge" {
+                if best_network.is_none() {
+                    best_network = Some(name.clone());
+                }
+                continue;
+            }
+            // Any other network is preferred (user-defined bridge)
+            best_network = Some(name.clone());
+            break;
+        }
+
+        best_network.ok_or_else(|| anyhow::anyhow!("No suitable network found for validator container"))
+    }
+
+    /// Static version of get_self_container_id for use before Self is constructed
+    fn get_container_id_static() -> anyhow::Result<String> {
+        // Method 1: Check hostname (Docker sets hostname to container ID by default)
+        if let Ok(hostname) = std::env::var("HOSTNAME") {
+            // Docker container IDs are 12+ hex characters
+            if hostname.len() >= 12 && hostname.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Ok(hostname);
+            }
+        }
+
+        // Method 2: Parse from cgroup (works on Linux)
+        if let Ok(cgroup) = std::fs::read_to_string("/proc/self/cgroup") {
+            for line in cgroup.lines() {
+                if let Some(docker_pos) = line.rfind("/docker/") {
+                    let id = &line[docker_pos + 8..];
+                    if id.len() >= 12 {
+                        return Ok(id[..12].to_string());
+                    }
+                }
+                if let Some(containerd_pos) = line.rfind("cri-containerd-") {
+                    let id = &line[containerd_pos + 15..];
+                    if id.len() >= 12 {
+                        return Ok(id[..12].to_string());
+                    }
+                }
+            }
+        }
+
+        // Method 3: Check mountinfo
+        if std::path::Path::new("/.dockerenv").exists() {
+            if let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") {
+                for line in mountinfo.lines() {
+                    if line.contains("/docker/containers/") {
+                        if let Some(start) = line.find("/docker/containers/") {
+                            let rest = &line[start + 19..];
+                            if let Some(end) = rest.find('/') {
+                                let id = &rest[..end];
+                                if id.len() >= 12 {
+                                    return Ok(id[..12].to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        anyhow::bail!("Not running in a Docker container or unable to determine container ID")
+    }
+
     /// Ensure the Docker network exists
     pub async fn ensure_network(&self) -> anyhow::Result<()> {
         let networks = self.docker.list_networks::<String>(None).await?;

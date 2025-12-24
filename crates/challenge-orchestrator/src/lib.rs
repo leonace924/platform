@@ -54,26 +54,12 @@ pub const PLATFORM_NETWORK: &str = "platform-network";
 
 impl ChallengeOrchestrator {
     pub async fn new(config: OrchestratorConfig) -> anyhow::Result<Self> {
-        let docker = DockerClient::connect_with_network(PLATFORM_NETWORK).await?;
+        // Auto-detect the network from the validator container
+        // This ensures challenge containers are on the same network as the validator
+        let docker = DockerClient::connect_auto_detect().await?;
 
-        // Ensure the Docker network exists
+        // Ensure the detected network exists (creates it if running outside Docker)
         docker.ensure_network().await?;
-
-        // Try to connect the current container to the network (if running in Docker)
-        // This is CRITICAL for communication with challenge containers
-        match docker.connect_self_to_network().await {
-            Ok(_) => {
-                tracing::info!("Validator container connected to {} network", PLATFORM_NETWORK);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Could not connect validator to {} network: {}. \
-                    Challenge containers may not be reachable. \
-                    Ensure validator is started with --network {} or add network in docker-compose.",
-                    PLATFORM_NETWORK, e, PLATFORM_NETWORK
-                );
-            }
-        }
 
         let challenges = Arc::new(RwLock::new(HashMap::new()));
         let health_monitor = HealthMonitor::new(challenges.clone(), config.health_check_interval);

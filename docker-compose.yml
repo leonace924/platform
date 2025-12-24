@@ -72,5 +72,4 @@ volumes:
 
 networks:
   platform-network:
-    name: platform-network
     driver: bridge
