@@ -488,6 +488,6 @@ mod tests {
     async fn test_node_creation() {
         let config = NodeConfig::default();
         let node = NetworkNode::new(config).await;
-        assert!(node.is_ok());
+        assert!(node.is_ok(), "Node creation failed: {:?}", node.err());
     }
 }

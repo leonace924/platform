@@ -46,9 +46,9 @@ impl MiniChainBehaviour {
             .heartbeat_interval(Duration::from_secs(1))
             .validation_mode(ValidationMode::Strict)
             .mesh_n(8) // Target mesh size (good for networks up to 64 nodes)
-            .mesh_n_low(1) // Minimum mesh size - lowered for small networks
+            .mesh_n_low(2) // Minimum mesh size before adding peers
             .mesh_n_high(16) // Maximum mesh size before pruning
-            .mesh_outbound_min(2) // Minimum outbound peers (must be <= mesh_n/2)
+            .mesh_outbound_min(1) // Minimum outbound peers (must be <= mesh_n_low)
             .gossip_lazy(6) // Peers to gossip to outside mesh
             .gossip_factor(0.25) // Fraction of peers to gossip to
             .do_px() // Enable peer exchange on PRUNE for discovery
