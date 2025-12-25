@@ -667,3 +667,198 @@ pub async fn log_event(
     ).await?;
     Ok(())
 }
+
+// ============================================================================
+// CHALLENGES (Dynamic Orchestration)
+// ============================================================================
+
+use crate::models::RegisteredChallenge;
+
+/// Get all registered challenges
+pub async fn get_challenges(pool: &Pool) -> Result<Vec<RegisteredChallenge>> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "SELECT id, name, docker_image, mechanism_id, emission_weight, 
+                    timeout_secs, cpu_cores, memory_mb, gpu_required, status,
+                    endpoint, container_id, last_health_check, is_healthy,
+                    created_at, updated_at
+             FROM challenges ORDER BY created_at",
+            &[],
+        )
+        .await?;
+
+    let challenges = rows
+        .iter()
+        .map(|row| RegisteredChallenge {
+            id: row.get(0),
+            name: row.get(1),
+            docker_image: row.get(2),
+            mechanism_id: row.get::<_, i16>(3) as u8,
+            emission_weight: row.get(4),
+            timeout_secs: row.get::<_, i32>(5) as u64,
+            cpu_cores: row.get(6),
+            memory_mb: row.get::<_, i32>(7) as u64,
+            gpu_required: row.get(8),
+            status: row.get(9),
+            endpoint: row.get(10),
+            container_id: row.get(11),
+            last_health_check: row
+                .get::<_, Option<chrono::DateTime<chrono::Utc>>>(12)
+                .map(|dt| dt.timestamp()),
+            is_healthy: row.get(13),
+        })
+        .collect();
+
+    Ok(challenges)
+}
+
+/// Get active challenges only
+pub async fn get_active_challenges(pool: &Pool) -> Result<Vec<RegisteredChallenge>> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "SELECT id, name, docker_image, mechanism_id, emission_weight, 
+                    timeout_secs, cpu_cores, memory_mb, gpu_required, status,
+                    endpoint, container_id, last_health_check, is_healthy,
+                    created_at, updated_at
+             FROM challenges WHERE status = 'active' ORDER BY created_at",
+            &[],
+        )
+        .await?;
+
+    let challenges = rows
+        .iter()
+        .map(|row| RegisteredChallenge {
+            id: row.get(0),
+            name: row.get(1),
+            docker_image: row.get(2),
+            mechanism_id: row.get::<_, i16>(3) as u8,
+            emission_weight: row.get(4),
+            timeout_secs: row.get::<_, i32>(5) as u64,
+            cpu_cores: row.get(6),
+            memory_mb: row.get::<_, i32>(7) as u64,
+            gpu_required: row.get(8),
+            status: row.get(9),
+            endpoint: row.get(10),
+            container_id: row.get(11),
+            last_health_check: row
+                .get::<_, Option<chrono::DateTime<chrono::Utc>>>(12)
+                .map(|dt| dt.timestamp()),
+            is_healthy: row.get(13),
+        })
+        .collect();
+
+    Ok(challenges)
+}
+
+/// Get a single challenge by ID
+pub async fn get_challenge(pool: &Pool, challenge_id: &str) -> Result<Option<RegisteredChallenge>> {
+    let client = pool.get().await?;
+    let row = client
+        .query_opt(
+            "SELECT id, name, docker_image, mechanism_id, emission_weight, 
+                    timeout_secs, cpu_cores, memory_mb, gpu_required, status,
+                    endpoint, container_id, last_health_check, is_healthy,
+                    created_at, updated_at
+             FROM challenges WHERE id = $1",
+            &[&challenge_id],
+        )
+        .await?;
+
+    Ok(row.map(|row| RegisteredChallenge {
+        id: row.get(0),
+        name: row.get(1),
+        docker_image: row.get(2),
+        mechanism_id: row.get::<_, i16>(3) as u8,
+        emission_weight: row.get(4),
+        timeout_secs: row.get::<_, i32>(5) as u64,
+        cpu_cores: row.get(6),
+        memory_mb: row.get::<_, i32>(7) as u64,
+        gpu_required: row.get(8),
+        status: row.get(9),
+        endpoint: row.get(10),
+        container_id: row.get(11),
+        last_health_check: row
+            .get::<_, Option<chrono::DateTime<chrono::Utc>>>(12)
+            .map(|dt| dt.timestamp()),
+        is_healthy: row.get(13),
+    }))
+}
+
+/// Register a new challenge
+pub async fn register_challenge(pool: &Pool, challenge: &RegisteredChallenge) -> Result<()> {
+    let client = pool.get().await?;
+    client
+        .execute(
+            "INSERT INTO challenges (id, name, docker_image, mechanism_id, emission_weight,
+                                    timeout_secs, cpu_cores, memory_mb, gpu_required, status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT(id) DO UPDATE SET
+                name = EXCLUDED.name,
+                docker_image = EXCLUDED.docker_image,
+                mechanism_id = EXCLUDED.mechanism_id,
+                emission_weight = EXCLUDED.emission_weight,
+                timeout_secs = EXCLUDED.timeout_secs,
+                cpu_cores = EXCLUDED.cpu_cores,
+                memory_mb = EXCLUDED.memory_mb,
+                gpu_required = EXCLUDED.gpu_required,
+                status = EXCLUDED.status,
+                updated_at = NOW()",
+            &[
+                &challenge.id,
+                &challenge.name,
+                &challenge.docker_image,
+                &(challenge.mechanism_id as i16),
+                &challenge.emission_weight,
+                &(challenge.timeout_secs as i32),
+                &challenge.cpu_cores,
+                &(challenge.memory_mb as i32),
+                &challenge.gpu_required,
+                &challenge.status,
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Update challenge container info (endpoint, container_id, health)
+pub async fn update_challenge_container(
+    pool: &Pool,
+    challenge_id: &str,
+    endpoint: Option<&str>,
+    container_id: Option<&str>,
+    is_healthy: bool,
+) -> Result<()> {
+    let client = pool.get().await?;
+    client
+        .execute(
+            "UPDATE challenges SET endpoint = $2, container_id = $3, 
+             is_healthy = $4, last_health_check = NOW(), updated_at = NOW()
+             WHERE id = $1",
+            &[&challenge_id, &endpoint, &container_id, &is_healthy],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Update challenge status
+pub async fn update_challenge_status(pool: &Pool, challenge_id: &str, status: &str) -> Result<()> {
+    let client = pool.get().await?;
+    client
+        .execute(
+            "UPDATE challenges SET status = $2, updated_at = NOW() WHERE id = $1",
+            &[&challenge_id, &status],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Delete a challenge
+pub async fn delete_challenge(pool: &Pool, challenge_id: &str) -> Result<bool> {
+    let client = pool.get().await?;
+    let result = client
+        .execute("DELETE FROM challenges WHERE id = $1", &[&challenge_id])
+        .await?;
+    Ok(result > 0)
+}

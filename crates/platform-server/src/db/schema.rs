@@ -164,6 +164,28 @@ CREATE TABLE IF NOT EXISTS network_state (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Registered challenges (loaded at startup, synced with validators)
+CREATE TABLE IF NOT EXISTS challenges (
+    id VARCHAR(64) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    docker_image VARCHAR(512) NOT NULL,
+    mechanism_id SMALLINT NOT NULL DEFAULT 1,
+    emission_weight DOUBLE PRECISION NOT NULL DEFAULT 0.1,
+    timeout_secs INTEGER DEFAULT 3600,
+    cpu_cores DOUBLE PRECISION DEFAULT 2.0,
+    memory_mb INTEGER DEFAULT 4096,
+    gpu_required BOOLEAN DEFAULT FALSE,
+    status VARCHAR(32) DEFAULT 'active',
+    endpoint VARCHAR(512),
+    container_id VARCHAR(128),
+    last_health_check TIMESTAMPTZ,
+    is_healthy BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_challenges_status ON challenges(status);
+
 -- Insert initial network state
 INSERT INTO network_state (key, value) VALUES 
     ('current_epoch', '0'),

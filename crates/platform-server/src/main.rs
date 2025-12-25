@@ -1,4 +1,4 @@
-//! Platform Server - Challenge Orchestrator for Subnet Owners
+//! Platform Server - Dynamic Challenge Orchestrator for Subnet Owners
 //!
 //! This server is the SINGLE SOURCE OF TRUTH for the Platform subnet.
 //! Run ONLY by the subnet owner at chain.platform.network
@@ -7,12 +7,13 @@
 //! ```
 //! Platform Server (this)
 //!  ├── Control Plane API (REST)
-//!  ├── Data API + Rule Engine
+//!  ├── Data API + Rule Engine  
+//!  ├── Challenge Orchestrator (dynamic)
+//!  │   └── Loads challenges from DB
+//!  │   └── Starts Docker containers
+//!  │   └── Routes /api/v1/challenges/{id}/*
 //!  ├── WebSocket for validators
 //!  └── PostgreSQL databases
-//!
-//! Validators connect via WebSocket to receive events and query Data API.
-//! Challenges run as always-on containers, accessing DB only via Data API.
 //! ```
 
 mod api;
@@ -21,27 +22,32 @@ mod data_api;
 mod db;
 mod models;
 mod observability;
+mod orchestration;
 mod rule_engine;
 mod state;
 mod websocket;
 
-use crate::challenge_proxy::ChallengeProxy;
 use crate::observability::init_sentry;
+use crate::orchestration::ChallengeManager;
 use crate::state::AppState;
 use crate::websocket::handler::ws_handler;
 use axum::{
-    routing::{any, delete, get, post, put},
-    Router,
+    body::Body,
+    extract::{Path, State},
+    http::{Request, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{any, get, post},
+    Json, Router,
 };
 use clap::Parser;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(name = "platform-server")]
-#[command(about = "Platform Network - Central API Server (Subnet Owner Only)")]
+#[command(about = "Platform Network - Central API Server with Dynamic Challenge Orchestration")]
 struct Args {
     /// Server port
     #[arg(short, long, default_value = "8080", env = "PORT")]
@@ -51,23 +57,15 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0", env = "HOST")]
     host: String,
 
-    /// Challenge ID
-    #[arg(short, long, env = "CHALLENGE_ID")]
-    challenge_id: String,
-
-    /// Challenge Docker image (e.g., term-challenge:latest)
-    #[arg(long, env = "CHALLENGE_IMAGE")]
-    challenge_image: Option<String>,
-
-    /// Challenge container URL (if already running)
-    #[arg(long, env = "CHALLENGE_URL")]
-    challenge_url: Option<String>,
-
-    /// Owner hotkey (required - only owner can run this server)
-    #[arg(long, env = "OWNER_HOTKEY")]
+    /// Owner hotkey (subnet owner SS58 address)
+    #[arg(
+        long,
+        env = "OWNER_HOTKEY",
+        default_value = "5GziQCcRpN8NCJktX343brnfuVe3w6gUYieeStXPD1Dag2At"
+    )]
     owner_hotkey: String,
 
-    /// PostgreSQL base URL
+    /// PostgreSQL base URL (without database name)
     #[arg(
         long,
         env = "DATABASE_URL",
@@ -86,7 +84,6 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // Initialize Sentry for error tracking (optional - set SENTRY_DSN env var)
     let _sentry_guard = init_sentry();
     if _sentry_guard.is_some() {
         info!("Sentry error tracking enabled");
@@ -95,43 +92,43 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     info!("╔══════════════════════════════════════════════════════════════╗");
-    info!("║       Platform Server - Single Source of Truth               ║");
+    info!("║   Platform Server - Dynamic Challenge Orchestration          ║");
     info!("║              (Subnet Owner Only)                             ║");
     info!("╚══════════════════════════════════════════════════════════════╝");
     info!("");
-    info!("  Challenge ID: {}", args.challenge_id);
     info!(
         "  Owner hotkey: {}...",
         &args.owner_hotkey[..16.min(args.owner_hotkey.len())]
     );
     info!("  Listening on: {}:{}", args.host, args.port);
 
-    // Initialize database
-    let db = db::init_challenge_db(&args.database_url, &args.challenge_id).await?;
-    info!(
-        "  Database: platform_{}",
-        args.challenge_id.replace('-', "_")
-    );
+    // Initialize database (creates platform_server database)
+    let db = db::init_db(&args.database_url).await?;
+    info!("  Database: platform_server");
 
-    // Initialize challenge proxy (connects to challenge Docker container)
-    let challenge_url = args
-        .challenge_url
-        .or_else(|| {
-            args.challenge_image
-                .as_ref()
-                .map(|_| "http://localhost:8081".to_string())
-        })
-        .unwrap_or_else(|| "http://localhost:8081".to_string());
-
-    let challenge_proxy = Arc::new(ChallengeProxy::new(&args.challenge_id, &challenge_url));
-    info!("  Challenge URL: {}", challenge_url);
+    // Initialize challenge orchestrator (loads challenges from DB)
+    info!("");
+    info!("  Initializing Challenge Orchestrator...");
+    let challenge_manager = match ChallengeManager::new(db.clone()).await {
+        Ok(cm) => {
+            // Start all registered challenges
+            if let Err(e) = cm.start_all().await {
+                warn!("  Some challenges failed to start: {}", e);
+            }
+            Some(Arc::new(cm))
+        }
+        Err(e) => {
+            warn!("  Challenge orchestrator disabled: {}", e);
+            warn!("  (Docker may not be available)");
+            None
+        }
+    };
 
     // Create application state
-    let state = Arc::new(AppState::new(
+    let state = Arc::new(AppState::new_dynamic(
         db,
-        args.challenge_id.clone(),
         Some(args.owner_hotkey.clone()),
-        challenge_proxy.clone(),
+        challenge_manager.clone(),
     ));
 
     // Build router
@@ -159,11 +156,14 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/network/state",
             get(api::challenges::get_network_state),
         )
-        .route("/api/v1/config", get(api::challenges::get_config_current))
-        .route(
-            "/api/v1/config",
-            post(api::challenges::update_config_current),
-        )
+        // === CHALLENGES MANAGEMENT ===
+        .route("/api/v1/challenges", get(list_challenges))
+        .route("/api/v1/challenges", post(register_challenge))
+        .route("/api/v1/challenges/:id", get(get_challenge))
+        .route("/api/v1/challenges/:id/start", post(start_challenge))
+        .route("/api/v1/challenges/:id/stop", post(stop_challenge))
+        // === DYNAMIC CHALLENGE ROUTING ===
+        .route("/api/v1/challenges/:id/*path", any(proxy_to_challenge))
         // === DATA API (with Claim/Lease) ===
         .route("/api/v1/data/tasks", get(data_api::list_tasks))
         .route("/api/v1/data/tasks/claim", post(data_api::claim_task))
@@ -212,11 +212,6 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/leaderboard/:agent_hash",
             get(api::leaderboard::get_agent_rank),
         )
-        // === CHALLENGE PROXY (routes to challenge container) ===
-        .route(
-            "/api/v1/challenge/*path",
-            any(challenge_proxy::proxy_handler),
-        )
         .layer(TraceLayer::new_for_http())
         .layer(
             CorsLayer::new()
@@ -236,7 +231,8 @@ async fn main() -> anyhow::Result<()> {
         addr
     );
     info!("╠══════════════════════════════════════════════════════════════╣");
-    info!("║  Control Plane: /api/v1/{{auth,validators,config}}           ║");
+    info!("║  Challenges:    /api/v1/challenges                          ║");
+    info!("║  Challenge API: /api/v1/challenges/{{id}}/*                   ║");
     info!("║  Data API:      /api/v1/data/{{tasks,results,snapshot}}      ║");
     info!(
         "║  WebSocket:     ws://{}/ws                          ║",
@@ -251,4 +247,204 @@ async fn main() -> anyhow::Result<()> {
 
 async fn health_check() -> &'static str {
     "OK"
+}
+
+// ============================================================================
+// CHALLENGE MANAGEMENT HANDLERS
+// ============================================================================
+
+async fn list_challenges(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<models::RegisteredChallenge>>, StatusCode> {
+    let challenges = db::queries::get_challenges(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(challenges))
+}
+
+async fn get_challenge(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<models::RegisteredChallenge>, StatusCode> {
+    let challenge = db::queries::get_challenge(&state.db, &id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(challenge))
+}
+
+async fn register_challenge(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<models::RegisterChallengeRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Verify owner signature
+    if !api::auth::verify_signature(
+        &req.owner_hotkey,
+        &format!("register_challenge:{}", req.id),
+        &req.signature,
+    ) {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid signature".to_string()));
+    }
+
+    // Verify owner
+    if state.owner_hotkey.as_ref() != Some(&req.owner_hotkey) {
+        return Err((StatusCode::FORBIDDEN, "Not the subnet owner".to_string()));
+    }
+
+    let challenge = models::RegisteredChallenge {
+        id: req.id.clone(),
+        name: req.name,
+        docker_image: req.docker_image,
+        mechanism_id: req.mechanism_id,
+        emission_weight: req.emission_weight,
+        timeout_secs: req.timeout_secs,
+        cpu_cores: req.cpu_cores,
+        memory_mb: req.memory_mb,
+        gpu_required: req.gpu_required,
+        status: "active".to_string(),
+        endpoint: None,
+        container_id: None,
+        last_health_check: None,
+        is_healthy: false,
+    };
+
+    db::queries::register_challenge(&state.db, &challenge)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    info!(
+        "Challenge registered: {} ({})",
+        challenge.id, challenge.docker_image
+    );
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "challenge_id": req.id
+    })))
+}
+
+async fn start_challenge(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let manager = state.challenge_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Orchestrator not available".to_string(),
+    ))?;
+
+    let challenge = db::queries::get_challenge(&state.db, &id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Challenge not found".to_string()))?;
+
+    let endpoint = manager
+        .start_challenge(&challenge)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "endpoint": endpoint
+    })))
+}
+
+async fn stop_challenge(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let manager = state.challenge_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Orchestrator not available".to_string(),
+    ))?;
+
+    manager
+        .stop_challenge(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+/// Dynamic proxy to challenge containers
+async fn proxy_to_challenge(
+    State(state): State<Arc<AppState>>,
+    Path((id, path)): Path<(String, String)>,
+    request: Request<Body>,
+) -> Response {
+    let manager = match &state.challenge_manager {
+        Some(m) => m,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Orchestrator not available",
+            )
+                .into_response()
+        }
+    };
+
+    let endpoint = match manager.get_endpoint(&id) {
+        Some(e) => e,
+        None => {
+            return (StatusCode::NOT_FOUND, "Challenge not found or not running").into_response()
+        }
+    };
+
+    let url = format!("{}/{}", endpoint, path);
+    let method = request.method().clone();
+    let headers = request.headers().clone();
+
+    let body_bytes = match axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!("Failed to read request body: {}", e);
+            return (StatusCode::BAD_REQUEST, "Failed to read request body").into_response();
+        }
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .unwrap();
+
+    let mut req_builder = client.request(method, &url);
+    for (key, value) in headers.iter() {
+        if key != "host" {
+            req_builder = req_builder.header(key, value);
+        }
+    }
+
+    if !body_bytes.is_empty() {
+        req_builder = req_builder.body(body_bytes.to_vec());
+    }
+
+    match req_builder.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let headers = resp.headers().clone();
+
+            match resp.bytes().await {
+                Ok(body) => {
+                    let mut response = Response::builder().status(status);
+                    for (key, value) in headers.iter() {
+                        response = response.header(key, value);
+                    }
+                    response
+                        .body(Body::from(body))
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                }
+                Err(e) => {
+                    error!("Failed to read response: {}", e);
+                    StatusCode::BAD_GATEWAY.into_response()
+                }
+            }
+        }
+        Err(e) => {
+            if e.is_timeout() {
+                (StatusCode::GATEWAY_TIMEOUT, "Challenge timeout").into_response()
+            } else {
+                error!("Proxy error: {}", e);
+                StatusCode::BAD_GATEWAY.into_response()
+            }
+        }
+    }
 }

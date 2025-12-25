@@ -422,3 +422,83 @@ pub struct WriteResultRequest {
     pub task_results: Option<serde_json::Value>,
     pub execution_time_ms: Option<i64>,
 }
+
+// ============================================================================
+// REGISTERED CHALLENGES (Dynamic Orchestration)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisteredChallenge {
+    pub id: String,
+    pub name: String,
+    pub docker_image: String,
+    pub mechanism_id: u8,
+    pub emission_weight: f64,
+    pub timeout_secs: u64,
+    pub cpu_cores: f64,
+    pub memory_mb: u64,
+    pub gpu_required: bool,
+    pub status: String,
+    pub endpoint: Option<String>,
+    pub container_id: Option<String>,
+    pub last_health_check: Option<i64>,
+    pub is_healthy: bool,
+}
+
+impl RegisteredChallenge {
+    pub fn new(id: &str, name: &str, docker_image: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            docker_image: docker_image.to_string(),
+            mechanism_id: 1,
+            emission_weight: 0.1,
+            timeout_secs: 3600,
+            cpu_cores: 2.0,
+            memory_mb: 4096,
+            gpu_required: false,
+            status: "active".to_string(),
+            endpoint: None,
+            container_id: None,
+            last_health_check: None,
+            is_healthy: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterChallengeRequest {
+    pub id: String,
+    pub name: String,
+    pub docker_image: String,
+    #[serde(default = "default_mechanism_id")]
+    pub mechanism_id: u8,
+    #[serde(default = "default_emission_weight")]
+    pub emission_weight: f64,
+    #[serde(default = "default_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_cpu")]
+    pub cpu_cores: f64,
+    #[serde(default = "default_memory")]
+    pub memory_mb: u64,
+    #[serde(default)]
+    pub gpu_required: bool,
+    pub owner_hotkey: String,
+    pub signature: String,
+}
+
+fn default_mechanism_id() -> u8 {
+    1
+}
+fn default_emission_weight() -> f64 {
+    0.1
+}
+fn default_timeout() -> u64 {
+    3600
+}
+fn default_cpu() -> f64 {
+    2.0
+}
+fn default_memory() -> u64 {
+    4096
+}

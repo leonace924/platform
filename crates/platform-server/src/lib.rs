@@ -20,6 +20,7 @@ pub mod data_api;
 pub mod db;
 pub mod models;
 pub mod observability;
+pub mod orchestration;
 pub mod rule_engine;
 pub mod state;
 pub mod websocket;

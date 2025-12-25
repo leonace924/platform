@@ -136,11 +136,18 @@ impl ChallengeProxy {
     }
 }
 
-/// Handler for proxying requests to the challenge container
+/// Handler for proxying requests to the challenge container (legacy mode)
 pub async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     Path(path): Path<String>,
     request: Request<Body>,
 ) -> Response {
-    state.challenge_proxy.proxy_request(&path, request).await
+    match &state.challenge_proxy {
+        Some(proxy) => proxy.proxy_request(&path, request).await,
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Challenge proxy not configured",
+        )
+            .into_response(),
+    }
 }

@@ -1,7 +1,8 @@
 //! Database module for Platform Server
 //!
-//! Each challenge gets its own database for isolation.
-//! Database naming: platform_{challenge_id}
+//! Supports two modes:
+//! 1. Single database for server: platform_server (dynamic orchestration)
+//! 2. Per-challenge databases: platform_{challenge_id} (legacy)
 
 pub mod queries;
 pub mod schema;
@@ -13,7 +14,40 @@ use tracing::info;
 
 pub type DbPool = Pool;
 
-/// Initialize database for a specific challenge
+/// Initialize centralized server database
+/// Creates platform_server database if it doesn't exist
+pub async fn init_db(base_url: &str) -> Result<DbPool> {
+    let db_name = "platform_server";
+
+    // Connect to postgres database to create server database if needed
+    let admin_pool = create_pool(&format!("{}/postgres", base_url)).await?;
+    let admin_client = admin_pool.get().await?;
+
+    // Check if database exists
+    let row = admin_client
+        .query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&db_name])
+        .await?;
+
+    if row.is_none() {
+        admin_client
+            .execute(&format!("CREATE DATABASE {}", db_name), &[])
+            .await?;
+        info!("Created database: {}", db_name);
+    }
+
+    // Connect to server database
+    let server_url = format!("{}/{}", base_url, db_name);
+    let pool = create_pool(&server_url).await?;
+
+    // Run migrations
+    let client = pool.get().await?;
+    schema::run_migrations(&client, "server").await?;
+
+    info!("Server database initialized: {}", db_name);
+    Ok(pool)
+}
+
+/// Initialize database for a specific challenge (legacy mode)
 /// Creates database if it doesn't exist, then runs migrations
 pub async fn init_challenge_db(base_url: &str, challenge_id: &str) -> Result<DbPool> {
     // Validate challenge_id (alphanumeric and hyphens only)

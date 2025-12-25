@@ -16,7 +16,8 @@ use tracing::info;
 pub async fn get_config_current(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ChallengeConfig>, StatusCode> {
-    let config = queries::get_challenge_config(&state.db, &state.challenge_id)
+    let challenge_id = state.challenge_id.as_deref().unwrap_or("default");
+    let config = queries::get_challenge_config(&state.db, challenge_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -36,9 +37,10 @@ pub async fn update_config_current(
     let session = auth::require_owner(&state, token)
         .map_err(|(code, msg)| (code, Json(json!({ "success": false, "error": msg }))))?;
 
+    let challenge_id = state.challenge_id.as_deref().unwrap_or("default");
     let message = format!(
         "update_config:{}:{}",
-        state.challenge_id,
+        challenge_id,
         serde_json::to_string(&req.config).unwrap_or_default()
     );
     if !auth::verify_signature(&req.owner_hotkey, &message, &req.signature) {
@@ -55,19 +57,16 @@ pub async fn update_config_current(
         ));
     }
 
-    queries::update_challenge_config(
-        &state.db,
-        &state.challenge_id,
-        &req.config,
-        &req.owner_hotkey,
-    )
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "success": false, "error": format!("Failed to update config: {}", e) })),
-        )
-    })?;
+    queries::update_challenge_config(&state.db, challenge_id, &req.config, &req.owner_hotkey)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({ "success": false, "error": format!("Failed to update config: {}", e) }),
+                ),
+            )
+        })?;
 
     info!("Challenge config updated by {}", req.owner_hotkey);
 
@@ -82,7 +81,7 @@ pub async fn update_config_current(
     }
 
     Ok(Json(
-        json!({ "success": true, "challenge_id": state.challenge_id }),
+        json!({ "success": true, "challenge_id": challenge_id }),
     ))
 }
 
