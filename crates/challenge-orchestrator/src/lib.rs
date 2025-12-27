@@ -246,7 +246,7 @@ impl ChallengeOrchestrator {
     }
 
     /// Clean up stale task containers from challenge evaluations
-    /// 
+    ///
     /// This removes containers that match the pattern but excludes:
     /// - Main challenge containers (challenge-*)
     /// - Platform validator/watchtower containers

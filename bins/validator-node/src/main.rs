@@ -25,6 +25,7 @@ use platform_network::{
 use platform_rpc::{OrchestratorCommand, RpcConfig, RpcServer};
 use platform_storage::Storage;
 use platform_subnet_manager::BanList;
+use secure_container_runtime::{ContainerBroker, SecurityPolicy, WsConfig};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -63,6 +64,124 @@ struct ContainerAuthResponse {
     session_token: Option<String>,
     expires_at: Option<u64>,
     error: Option<String>,
+}
+
+// ==================== Platform Server Client ====================
+
+/// Client for communicating with the centralized platform-server
+#[derive(Clone)]
+struct PlatformServerClient {
+    base_url: String,
+    client: reqwest::Client,
+}
+
+impl PlatformServerClient {
+    fn new(base_url: &str) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("Failed to create HTTP client");
+
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            client,
+        }
+    }
+
+    /// Fetch weights for a specific challenge from platform-server
+    async fn get_challenge_weights(
+        &self,
+        challenge_id: &str,
+        epoch: u64,
+    ) -> Result<Vec<(u16, u16)>> {
+        let url = format!(
+            "{}/api/v1/challenges/{}/get_weights?epoch={}",
+            self.base_url, challenge_id, epoch
+        );
+
+        let response =
+            self.client.get(&url).send().await.map_err(|e| {
+                anyhow::anyhow!("Failed to fetch weights from platform-server: {}", e)
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "Platform server returned error {}: {}",
+                status,
+                body
+            ));
+        }
+
+        #[derive(serde::Deserialize)]
+        struct WeightsResponse {
+            weights: Vec<WeightEntry>,
+            #[allow(dead_code)]
+            epoch: u64,
+            #[allow(dead_code)]
+            challenge_id: String,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct WeightEntry {
+            uid: u16,
+            weight: u16,
+        }
+
+        let weights_resp: WeightsResponse = response
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse weights response: {}", e))?;
+
+        Ok(weights_resp
+            .weights
+            .into_iter()
+            .map(|w| (w.uid, w.weight))
+            .collect())
+    }
+
+    /// List all active challenges from platform-server
+    async fn list_challenges(&self) -> Result<Vec<ChallengeInfo>> {
+        let url = format!("{}/api/v1/challenges", self.base_url);
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to list challenges: {}", e))?;
+
+        if !response.status().is_success() {
+            return Ok(vec![]);
+        }
+
+        let challenges: Vec<ChallengeInfo> = response.json().await.unwrap_or_default();
+        Ok(challenges)
+    }
+
+    /// Check health of platform-server
+    async fn health_check(&self) -> bool {
+        let url = format!("{}/health", self.base_url);
+        self.client
+            .get(&url)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ChallengeInfo {
+    id: String,
+    name: String,
+    #[serde(default)]
+    mechanism_id: u8,
+    #[serde(default)]
+    emission_weight: f64,
+    #[serde(default)]
+    is_healthy: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -164,6 +283,24 @@ struct Args {
     /// Health check interval for challenge containers (seconds)
     #[arg(long, default_value = "30")]
     health_check_interval: u64,
+
+    // === Container Broker Options ===
+    /// WebSocket port for container broker (allows challenges to spawn containers securely)
+    /// Challenge containers connect via ws://platform-validator:8090
+    #[arg(long, env = "BROKER_WS_PORT", default_value = "8090")]
+    broker_port: u16,
+
+    /// JWT secret for container broker authentication
+    /// If not set, broker runs without auth (development mode only)
+    #[arg(long, env = "BROKER_JWT_SECRET")]
+    broker_jwt_secret: Option<String>,
+
+    // === Platform Server Integration ===
+    /// Platform server URL for centralized orchestration
+    /// When set, validator fetches weights from platform-server instead of local calculation
+    /// Example: https://chain.platform.network
+    #[arg(long, env = "PLATFORM_SERVER_URL")]
+    platform_server: Option<String>,
 }
 
 /// Initialize Sentry error monitoring
@@ -306,7 +443,10 @@ async fn run_validator() -> Result<()> {
         error!("SCHEMA INTEGRITY CHECK FAILED!\n{}", e);
         return Err(anyhow::anyhow!("Schema integrity check failed: {}", e));
     }
-    info!("Schema integrity verified for version {}", platform_core::CURRENT_STATE_VERSION);
+    info!(
+        "Schema integrity verified for version {}",
+        platform_core::CURRENT_STATE_VERSION
+    );
 
     info!("Starting validator node...");
 
@@ -1308,6 +1448,64 @@ async fn run_validator() -> Result<()> {
     // The ChallengeRuntime is kept for epoch management and weight collection only
     // tokio::spawn(async move { runtime_for_eval.run_evaluation_loop().await; });
 
+    // ==========================================================================
+    // Container Broker for secure container management
+    // ==========================================================================
+    // Challenges connect via WebSocket to spawn sandbox containers without direct Docker access.
+    // This is safer than sharing the Docker socket with challenge containers.
+
+    let broker_jwt_secret = args.broker_jwt_secret.clone();
+    let broker_port = args.broker_port;
+
+    if args.docker_challenges && broker_port > 0 {
+        info!("Starting container broker on port {}...", broker_port);
+
+        // Use development policy if no JWT secret (allows local testing)
+        let policy = if broker_jwt_secret.is_some() {
+            info!("Container broker: Using strict security policy with JWT auth");
+            SecurityPolicy::strict()
+        } else {
+            warn!("Container broker: No JWT secret set - using development policy");
+            warn!("  Set BROKER_JWT_SECRET for production deployments");
+            SecurityPolicy::development()
+        };
+
+        match ContainerBroker::with_policy(policy).await {
+            Ok(broker) => {
+                let broker = Arc::new(broker);
+                let ws_config = WsConfig {
+                    bind_addr: format!("0.0.0.0:{}", broker_port),
+                    jwt_secret: broker_jwt_secret.clone(),
+                    allowed_challenges: vec![], // All challenges allowed
+                    max_connections_per_challenge: 10,
+                };
+
+                // Start WebSocket server in background
+                let broker_for_ws = broker.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        secure_container_runtime::run_ws_server(broker_for_ws, ws_config).await
+                    {
+                        error!("Container broker WebSocket server error: {}", e);
+                    }
+                });
+
+                info!(
+                    "Container broker WebSocket server started on ws://0.0.0.0:{}",
+                    broker_port
+                );
+                info!(
+                    "  Challenges can connect via: ws://platform-validator:{}",
+                    broker_port
+                );
+            }
+            Err(e) => {
+                warn!("Failed to start container broker: {}", e);
+                warn!("  Challenges will use direct Docker (if available)");
+            }
+        }
+    }
+
     // Initialize Challenge Orchestrator for Docker containers (if enabled)
     let challenge_orchestrator: Option<Arc<ChallengeOrchestrator>> = if args.docker_challenges {
         info!("Initializing Docker challenge orchestrator...");
@@ -1361,6 +1559,49 @@ async fn run_validator() -> Result<()> {
         info!("Docker challenge orchestration disabled");
         None
     };
+
+    // ==========================================================================
+    // Platform Server Client (for centralized weight calculation)
+    // ==========================================================================
+    let platform_server_client: Option<Arc<PlatformServerClient>> =
+        if let Some(ref platform_url) = args.platform_server {
+            info!("Connecting to platform server: {}", platform_url);
+            let client = PlatformServerClient::new(platform_url);
+
+            // Verify connectivity
+            if client.health_check().await {
+                info!("Platform server connection verified");
+
+                // List available challenges
+                match client.list_challenges().await {
+                    Ok(challenges) => {
+                        if challenges.is_empty() {
+                            info!("No challenges registered on platform server yet");
+                        } else {
+                            info!("Platform server challenges:");
+                            for c in &challenges {
+                                info!(
+                                    "  - {} (mechanism={}, weight={:.2}, healthy={})",
+                                    c.id, c.mechanism_id, c.emission_weight, c.is_healthy
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => warn!("Failed to list platform server challenges: {}", e),
+                }
+
+                Some(Arc::new(client))
+            } else {
+                warn!(
+                "Platform server not reachable at {} - falling back to local weight calculation",
+                platform_url
+            );
+                None
+            }
+        } else {
+            info!("Platform server not configured - using local weight calculation");
+            None
+        };
 
     // Spawn orchestrator command handler (receives commands from RPC sudo_submit)
     // Also handles dynamic route discovery via /.well-known/routes
@@ -1652,14 +1893,20 @@ async fn run_validator() -> Result<()> {
 
                 // Get all challenge endpoints (these have the real container hostnames with suffixes)
                 let endpoints: Vec<(String, String)> = {
-                    endpoints_for_outbox.read().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    endpoints_for_outbox
+                        .read()
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
                 };
 
                 if endpoints.is_empty() {
                     // Log at info level occasionally to confirm task is running
-                    static EMPTY_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    static EMPTY_COUNT: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
                     let count = EMPTY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if count % 12 == 0 { // Log every minute (12 * 5s = 60s)
+                    if count % 12 == 0 {
+                        // Log every minute (12 * 5s = 60s)
                         info!("P2P outbox poll: no challenge endpoints registered yet (poll #{count})");
                     }
                     continue;
@@ -1668,13 +1915,17 @@ async fn run_validator() -> Result<()> {
                 // Also get configs for challenge metadata
                 let configs: std::collections::HashMap<String, ChallengeContainerConfig> = {
                     let state = state_for_outbox.read();
-                    state.challenge_configs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+                    state
+                        .challenge_configs
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.clone()))
+                        .collect()
                 };
 
                 for (challenge_id, endpoint) in &endpoints {
                     // Use the real endpoint (includes suffix like challenge-term-challenge-4133b3431b1c)
                     let outbox_url = format!("{}/p2p/outbox", endpoint);
-                    
+
                     // Get config for this challenge
                     let config = match configs.get(challenge_id) {
                         Some(c) => c.clone(),
@@ -1691,19 +1942,27 @@ async fn run_validator() -> Result<()> {
                                     outbox.get("messages").and_then(|m| m.as_array())
                                 {
                                     if !messages.is_empty() {
-                                        info!("Found {} messages in outbox for challenge {}", messages.len(), challenge_id);
+                                        info!(
+                                            "Found {} messages in outbox for challenge {}",
+                                            messages.len(),
+                                            challenge_id
+                                        );
                                     }
                                     for msg_value in messages {
                                         // Parse the outbox message
                                         let message = match msg_value.get("message") {
                                             Some(m) => m,
                                             None => {
-                                                warn!("Outbox message missing 'message' field: {:?}", msg_value);
+                                                warn!(
+                                                    "Outbox message missing 'message' field: {:?}",
+                                                    msg_value
+                                                );
                                                 continue;
                                             }
                                         };
-                                        let target = msg_value.get("target").and_then(|t| t.as_str());
-                                        
+                                        let target =
+                                            msg_value.get("target").and_then(|t| t.as_str());
+
                                         // Check if this is a DecryptApiKeyRequest - handle locally
                                         if let Ok(platform_challenge_sdk::ChallengeP2PMessage::DecryptApiKeyRequest(req)) =
                                             serde_json::from_value::<platform_challenge_sdk::ChallengeP2PMessage>(message.clone()) {
@@ -1751,15 +2010,15 @@ async fn run_validator() -> Result<()> {
                                                     continue; // Don't broadcast this message
                                             }
 
-                                            // Create ChallengeNetworkMessage to broadcast
-                                            let challenge_msg = ChallengeNetworkMessage {
-                                                challenge_id: config.name.clone(),
-                                                message_type: ChallengeMessageType::Custom(
-                                                    "p2p_bridge".to_string(),
-                                                ),
-                                                payload: serde_json::to_vec(message)
-                                                    .unwrap_or_default(),
-                                            };
+                                        // Create ChallengeNetworkMessage to broadcast
+                                        let challenge_msg = ChallengeNetworkMessage {
+                                            challenge_id: config.name.clone(),
+                                            message_type: ChallengeMessageType::Custom(
+                                                "p2p_bridge".to_string(),
+                                            ),
+                                            payload: serde_json::to_vec(message)
+                                                .unwrap_or_default(),
+                                        };
 
                                         let network_msg =
                                             NetworkMessage::ChallengeMessage(challenge_msg);
@@ -1780,7 +2039,10 @@ async fn run_validator() -> Result<()> {
                                                         );
                                                     }
                                                     Err(e) => {
-                                                        error!("Failed to send broadcast command: {}", e);
+                                                        error!(
+                                                            "Failed to send broadcast command: {}",
+                                                            e
+                                                        );
                                                     }
                                                 }
                                             }
@@ -1801,7 +2063,11 @@ async fn run_validator() -> Result<()> {
                             }
                         }
                         Ok(resp) => {
-                            debug!("Outbox poll failed for {}: HTTP {}", challenge_id, resp.status());
+                            debug!(
+                                "Outbox poll failed for {}: HTTP {}",
+                                challenge_id,
+                                resp.status()
+                            );
                         }
                         Err(e) => {
                             debug!("Outbox poll error for {}: {}", challenge_id, e);
@@ -1830,6 +2096,7 @@ async fn run_validator() -> Result<()> {
     let runtime_for_blocks = challenge_runtime.clone();
     let subtensor_clone = subtensor.clone();
     let subtensor_signer_clone = subtensor_signer.clone();
+    let platform_server_for_loop = platform_server_client.clone();
     let db_for_blocks = distributed_db.clone();
     let db_sync_for_loop = db_sync_manager.clone();
     let mut block_counter = 0u64;
@@ -2060,8 +2327,51 @@ async fn run_validator() -> Result<()> {
                         // Collect and commit weights for all mechanisms
                         // With Subtensor, set_weights() handles commit-reveal automatically
                         if let (Some(st), Some(signer)) = (subtensor_clone.as_ref(), subtensor_signer_clone.as_ref()) {
-                            // Collect weights from all challenges
-                            let mechanism_weights = runtime_for_blocks.collect_and_get_weights().await;
+                            // Try to get weights from platform-server first (centralized, deterministic)
+                            let mechanism_weights = if let Some(ref ps_client) = platform_server_for_loop {
+                                info!("Fetching weights from platform-server for epoch {}...", epoch);
+
+                                // Get challenges from platform server
+                                match ps_client.list_challenges().await {
+                                    Ok(challenges) if !challenges.is_empty() => {
+                                        let mut weights_from_server = Vec::new();
+
+                                        for challenge in challenges {
+                                            match ps_client.get_challenge_weights(&challenge.id, epoch).await {
+                                                Ok(weight_pairs) => {
+                                                    let uids: Vec<u16> = weight_pairs.iter().map(|(u, _)| *u).collect();
+                                                    let weights: Vec<u16> = weight_pairs.iter().map(|(_, w)| *w).collect();
+
+                                                    info!(
+                                                        "Got {} weights for challenge {} (mechanism {}) from platform-server",
+                                                        uids.len(), challenge.id, challenge.mechanism_id
+                                                    );
+
+                                                    if !uids.is_empty() {
+                                                        weights_from_server.push((challenge.mechanism_id, uids, weights));
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to get weights for challenge {}: {}", challenge.id, e);
+                                                }
+                                            }
+                                        }
+
+                                        weights_from_server
+                                    }
+                                    Ok(_) => {
+                                        info!("No challenges on platform-server, using local weights");
+                                        runtime_for_blocks.collect_and_get_weights().await
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to list platform-server challenges: {}, using local weights", e);
+                                        runtime_for_blocks.collect_and_get_weights().await
+                                    }
+                                }
+                            } else {
+                                // No platform-server - use local weight calculation
+                                runtime_for_blocks.collect_and_get_weights().await
+                            };
 
                             let weights_to_submit = if mechanism_weights.is_empty() {
                                 // No challenge weights - submit burn weights to UID 0
@@ -2552,7 +2862,7 @@ async fn run_validator() -> Result<()> {
                     // Periodic sync of validators to challenge containers
                     if last_challenge_validator_sync.elapsed() >= challenge_validator_sync_interval {
                         last_challenge_validator_sync = std::time::Instant::now();
-                        
+
                         // Get current validators from chain state
                         let validators: Vec<_> = chain_state
                             .read()
@@ -3000,7 +3310,9 @@ async fn handle_message(
                 {
                     let mut state = chain_state.write();
                     if !state.challenge_configs.contains_key(&config.challenge_id) {
-                        state.challenge_configs.insert(config.challenge_id, config.clone());
+                        state
+                            .challenge_configs
+                            .insert(config.challenge_id, config.clone());
                         info!(
                             "Added challenge '{}' ({}) to ChainState from P2P Proposal",
                             config.name, config.challenge_id
@@ -3161,7 +3473,7 @@ async fn handle_message(
             let msg_payload = challenge_msg.payload.clone();
             let kp = keypair.unwrap().clone();
             let sessions = container_auth_sessions.unwrap().clone();
-            
+
             // Look up the correct endpoint from the stored endpoints map
             let base_url = if let Some(endpoints) = challenge_endpoints {
                 let eps = endpoints.read();
@@ -3172,7 +3484,7 @@ async fn handle_message(
             } else {
                 None
             };
-            
+
             let base_url = match base_url {
                 Some(url) => url,
                 None => {
@@ -3245,7 +3557,10 @@ async fn handle_message(
                             );
                             Some(p2p_msg)
                         } else {
-                            warn!("Failed to parse Custom({}) payload as ChallengeP2PMessage", custom_type);
+                            warn!(
+                                "Failed to parse Custom({}) payload as ChallengeP2PMessage",
+                                custom_type
+                            );
                             None
                         }
                     }
@@ -3283,10 +3598,17 @@ async fn handle_message(
                             warn!("Auth token expired for challenge {}, will re-authenticate on next message", challenge_id);
                         }
                         Ok(resp) => {
-                            debug!("Challenge {} container returned {}", challenge_id, resp.status());
+                            debug!(
+                                "Challenge {} container returned {}",
+                                challenge_id,
+                                resp.status()
+                            );
                         }
                         Err(e) => {
-                            debug!("Failed to forward to challenge {} container: {}", challenge_id, e);
+                            debug!(
+                                "Failed to forward to challenge {} container: {}",
+                                challenge_id, e
+                            );
                         }
                     }
                 }
@@ -3343,7 +3665,7 @@ async fn handle_message(
                     hex::encode(hasher.finalize())
                 });
                 let validator_hotkey = signer.to_hex();
-                
+
                 // Look up the correct endpoint from the stored endpoints map
                 let base_url = if let Some(endpoints) = challenge_endpoints {
                     let eps = endpoints.read();
@@ -3355,7 +3677,7 @@ async fn handle_message(
                 } else {
                     None
                 };
-                
+
                 let base_url = match base_url {
                     Some(url) => url,
                     None => {

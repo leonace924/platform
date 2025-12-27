@@ -1,0 +1,43 @@
+version: "3.8"
+
+# ==========================================================================
+# Platform Server Deployment
+# ==========================================================================
+# Usage:
+#   DATABASE_URL="postgresql://user:pass@host:5432/db" docker compose -f docker-compose.server.yml up -d
+#
+# Example with Supabase:
+#   DATABASE_URL="postgresql://postgres:PASSWORD@db.xxx.supabase.co:5432/postgres" docker compose -f docker-compose.server.yml up -d
+# ==========================================================================
+
+services:
+  platform-server:
+    image: ghcr.io/platformnetwork/platform:latest
+    container_name: platform-server
+    restart: unless-stopped
+    entrypoint: ["platform", "server"]
+    command:
+      - --port
+      - "8080"
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - RUST_LOG=info,platform_server=debug
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    networks:
+      - platform-challenges
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  platform-challenges:
+    driver: bridge
+    name: platform-challenges

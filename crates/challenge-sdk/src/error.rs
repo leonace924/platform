@@ -8,19 +8,38 @@ pub type Result<T> = std::result::Result<T, ChallengeError>;
 /// Challenge errors
 #[derive(Error, Debug)]
 pub enum ChallengeError {
-    #[error("Database error: {0}")]
-    Database(String),
+    // ========== New API errors ==========
+    #[error("Connection error: {0}")]
+    Connection(String),
 
-    #[error("Serialization error: {0}")]
-    Serialization(String),
+    #[error("Authentication error: {0}")]
+    Auth(String),
 
+    #[error("Configuration error: {0}")]
+    Config(String),
+
+    #[error("IO error: {0}")]
+    Io(String),
+
+    // ========== Evaluation errors ==========
     #[error("Evaluation error: {0}")]
     Evaluation(String),
 
     #[error("Validation error: {0}")]
     Validation(String),
 
+    #[error("Timeout")]
+    Timeout,
+
+    // ========== Legacy errors (kept for compatibility) ==========
+    #[error("Database error: {0}")]
+    Database(String),
+
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+
     #[error("Configuration error: {0}")]
+    #[deprecated(note = "Use Config variant instead")]
     Configuration(String),
 
     #[error("Unsupported job type: {0}")]
@@ -43,9 +62,6 @@ pub enum ChallengeError {
 
     #[error("Commitment mismatch")]
     CommitmentMismatch,
-
-    #[error("Timeout")]
-    Timeout,
 
     #[error("Internal error: {0}")]
     Internal(String),

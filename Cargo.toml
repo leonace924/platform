@@ -15,6 +15,8 @@ members = [
     "crates/auto-updater",
     "crates/distributed-db",
     "crates/secure-container-runtime",
+    "crates/platform-server",
+    "bins/platform",
     "bins/validator-node",
     "bins/csudo",
     "bins/utils",
@@ -76,10 +78,13 @@ chrono = { version = "0.4", features = ["serde"] }
 parking_lot = "0.12"
 
 # CLI
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 
 # Testing
 tempfile = "3.12"
+
+# HTTP/Web (for platform-server)
+reqwest = { version = "0.12", features = ["json"] }
 
 # Patch for TLE/CRv4 compatibility (w3f-bls version conflict)
 [patch.crates-io]

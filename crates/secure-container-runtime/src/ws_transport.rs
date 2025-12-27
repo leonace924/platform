@@ -1,0 +1,323 @@
+//! WebSocket transport for container broker
+//!
+//! Allows challenges to connect via WebSocket instead of Unix socket.
+//! Supports JWT authentication for secure remote access.
+
+use crate::protocol::{decode_request, encode_response, Response};
+use crate::types::ContainerError;
+use crate::ContainerBroker;
+use futures::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::TcpListener;
+use tokio::sync::RwLock;
+use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tracing::{debug, error, info, warn};
+
+/// WebSocket server configuration
+#[derive(Debug, Clone)]
+pub struct WsConfig {
+    /// Address to bind (e.g., "0.0.0.0:8090")
+    pub bind_addr: String,
+    /// JWT secret for authentication (if None, auth disabled)
+    pub jwt_secret: Option<String>,
+    /// Allowed challenge IDs (if empty, all allowed)
+    pub allowed_challenges: Vec<String>,
+    /// Max connections per challenge
+    pub max_connections_per_challenge: usize,
+}
+
+impl Default for WsConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: "0.0.0.0:8090".to_string(),
+            jwt_secret: std::env::var("BROKER_JWT_SECRET").ok(),
+            allowed_challenges: vec![],
+            max_connections_per_challenge: 10,
+        }
+    }
+}
+
+/// JWT claims for WebSocket authentication
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WsClaims {
+    /// Challenge ID
+    pub challenge_id: String,
+    /// Owner/Validator ID
+    pub owner_id: String,
+    /// Expiration timestamp
+    pub exp: u64,
+    /// Issued at timestamp
+    pub iat: u64,
+}
+
+/// Authentication message sent by client on connect
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuthMessage {
+    /// JWT token
+    pub token: String,
+}
+
+/// Connection state
+struct WsConnection {
+    challenge_id: String,
+    owner_id: String,
+    authenticated: bool,
+}
+
+/// Run WebSocket server for the broker
+pub async fn run_ws_server(broker: Arc<ContainerBroker>, config: WsConfig) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(&config.bind_addr).await?;
+    info!(addr = %config.bind_addr, "WebSocket broker server listening");
+
+    let connections: Arc<RwLock<std::collections::HashMap<String, usize>>> =
+        Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, addr)) => {
+                let broker = broker.clone();
+                let config = config.clone();
+                let connections = connections.clone();
+
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        handle_ws_connection(stream, addr, broker, config, connections).await
+                    {
+                        error!(error = %e, addr = %addr, "WebSocket connection error");
+                    }
+                });
+            }
+            Err(e) => {
+                error!(error = %e, "WebSocket accept error");
+            }
+        }
+    }
+}
+
+async fn handle_ws_connection(
+    stream: tokio::net::TcpStream,
+    addr: SocketAddr,
+    broker: Arc<ContainerBroker>,
+    config: WsConfig,
+    connections: Arc<RwLock<std::collections::HashMap<String, usize>>>,
+) -> anyhow::Result<()> {
+    let ws_stream = accept_async(stream).await?;
+    let (mut write, mut read) = ws_stream.split();
+
+    info!(addr = %addr, "New WebSocket connection");
+
+    // Authentication phase
+    let mut conn_state = WsConnection {
+        challenge_id: String::new(),
+        owner_id: String::new(),
+        authenticated: config.jwt_secret.is_none(), // No auth required if no secret
+    };
+
+    if !conn_state.authenticated {
+        // Wait for auth message
+        let auth_timeout = tokio::time::Duration::from_secs(10);
+        match tokio::time::timeout(auth_timeout, read.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                match authenticate(&text, &config) {
+                    Ok(claims) => {
+                        conn_state.challenge_id = claims.challenge_id;
+                        conn_state.owner_id = claims.owner_id;
+                        conn_state.authenticated = true;
+
+                        // Check connection limit
+                        let mut conns = connections.write().await;
+                        let count = conns.entry(conn_state.challenge_id.clone()).or_insert(0);
+                        if *count >= config.max_connections_per_challenge {
+                            let err_response = Response::Error {
+                                error: ContainerError::PolicyViolation(
+                                    "Too many connections".to_string(),
+                                ),
+                                request_id: "auth".to_string(),
+                            };
+                            let _ = write
+                                .send(Message::Text(encode_response(&err_response)))
+                                .await;
+                            return Ok(());
+                        }
+                        *count += 1;
+                        drop(conns);
+
+                        info!(
+                            addr = %addr,
+                            challenge_id = %conn_state.challenge_id,
+                            "WebSocket authenticated"
+                        );
+
+                        // Send auth success
+                        let success = Response::Pong {
+                            version: "authenticated".to_string(),
+                            request_id: "auth".to_string(),
+                        };
+                        write.send(Message::Text(encode_response(&success))).await?;
+                    }
+                    Err(e) => {
+                        warn!(addr = %addr, error = %e, "WebSocket auth failed");
+                        let err_response = Response::Error {
+                            error: ContainerError::Unauthorized(e.to_string()),
+                            request_id: "auth".to_string(),
+                        };
+                        write
+                            .send(Message::Text(encode_response(&err_response)))
+                            .await?;
+                        return Ok(());
+                    }
+                }
+            }
+            _ => {
+                warn!(addr = %addr, "WebSocket auth timeout or invalid message");
+                return Ok(());
+            }
+        }
+    }
+
+    // Main message loop
+    while let Some(msg) = read.next().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                let response = process_request(&text, &conn_state, &broker, &config).await;
+                write
+                    .send(Message::Text(encode_response(&response)))
+                    .await?;
+            }
+            Ok(Message::Ping(data)) => {
+                write.send(Message::Pong(data)).await?;
+            }
+            Ok(Message::Close(_)) => {
+                debug!(addr = %addr, "WebSocket closed by client");
+                break;
+            }
+            Err(e) => {
+                error!(addr = %addr, error = %e, "WebSocket read error");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // Cleanup connection count
+    if conn_state.authenticated && !conn_state.challenge_id.is_empty() {
+        let mut conns = connections.write().await;
+        if let Some(count) = conns.get_mut(&conn_state.challenge_id) {
+            *count = count.saturating_sub(1);
+        }
+    }
+
+    Ok(())
+}
+
+fn authenticate(text: &str, config: &WsConfig) -> anyhow::Result<WsClaims> {
+    let auth_msg: AuthMessage = serde_json::from_str(text)?;
+
+    let secret = config
+        .jwt_secret
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No JWT secret configured"))?;
+
+    // Decode and validate JWT
+    let key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes());
+    let validation = jsonwebtoken::Validation::default();
+
+    let token_data = jsonwebtoken::decode::<WsClaims>(&auth_msg.token, &key, &validation)?;
+
+    // Check if challenge is allowed
+    if !config.allowed_challenges.is_empty()
+        && !config
+            .allowed_challenges
+            .contains(&token_data.claims.challenge_id)
+    {
+        anyhow::bail!("Challenge not allowed: {}", token_data.claims.challenge_id);
+    }
+
+    Ok(token_data.claims)
+}
+
+async fn process_request(
+    text: &str,
+    conn: &WsConnection,
+    broker: &ContainerBroker,
+    _config: &WsConfig,
+) -> Response {
+    // Parse request
+    let request = match decode_request(text) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::Error {
+                error: ContainerError::InvalidRequest(e.to_string()),
+                request_id: "unknown".to_string(),
+            };
+        }
+    };
+
+    let request_id = request.request_id().to_string();
+
+    // Verify challenge_id matches authenticated connection
+    if let Some(req_challenge) = request.challenge_id() {
+        if !conn.challenge_id.is_empty() && req_challenge != conn.challenge_id {
+            return Response::Error {
+                error: ContainerError::Unauthorized(format!(
+                    "Challenge mismatch: authenticated as {}, requested {}",
+                    conn.challenge_id, req_challenge
+                )),
+                request_id,
+            };
+        }
+    }
+
+    // Forward to broker
+    broker.handle_request(request).await
+}
+
+/// Generate a JWT token for a challenge
+pub fn generate_token(
+    challenge_id: &str,
+    owner_id: &str,
+    secret: &str,
+    ttl_secs: u64,
+) -> anyhow::Result<String> {
+    use jsonwebtoken::{encode, EncodingKey, Header};
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+
+    let claims = WsClaims {
+        challenge_id: challenge_id.to_string(),
+        owner_id: owner_id.to_string(),
+        iat: now,
+        exp: now + ttl_secs,
+    };
+
+    let token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )?;
+
+    Ok(token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_and_verify_token() {
+        let secret = "test-secret-key-123";
+        let token = generate_token("term-challenge", "validator-1", secret, 3600).unwrap();
+
+        // Verify token
+        let key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes());
+        let validation = jsonwebtoken::Validation::default();
+        let decoded = jsonwebtoken::decode::<WsClaims>(&token, &key, &validation).unwrap();
+
+        assert_eq!(decoded.claims.challenge_id, "term-challenge");
+        assert_eq!(decoded.claims.owner_id, "validator-1");
+    }
+}

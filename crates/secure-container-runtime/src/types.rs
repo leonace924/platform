@@ -248,6 +248,12 @@ pub enum ContainerError {
 
     #[error("Internal error: {0}")]
     InternalError(String),
+
+    #[error("Unauthorized: {0}")]
+    Unauthorized(String),
+
+    #[error("Invalid request: {0}")]
+    InvalidRequest(String),
 }
 
 /// Standard labels applied to all containers

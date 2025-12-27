@@ -1,85 +1,91 @@
-# ============================================================================
-# Platform Chain - Optimized Multi-stage Docker Build with Dependency Caching
-# ============================================================================
+# =============================================================================
+# Platform Network - Unified Docker Image
+# =============================================================================
+# Single image that can run as either server or validator mode:
+#   docker run platform server [OPTIONS]
+#   docker run platform validator --secret-key <KEY> [OPTIONS]
+# =============================================================================
 
-# Stage 1: Chef - prepare recipe for dependency caching
-FROM rust:slim-trixie AS chef
-RUN cargo install cargo-chef --locked
-WORKDIR /app
+# Build stage
+FROM rust:1.92-bookworm AS builder
 
-# Stage 2: Planner - analyze dependencies
-FROM chef AS planner
-COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
-COPY bins ./bins
-COPY tests ./tests
-RUN cargo chef prepare --recipe-path recipe.json
-
-# Stage 3: Builder - build with cached dependencies
-FROM chef AS builder
-
-# Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install dependencies
+RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     protobuf-compiler \
+    cmake \
     clang \
     libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Build dependencies first (this layer is cached if dependencies don't change)
-COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
-
-# Copy source code and build
-COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
-COPY bins ./bins
-COPY tests ./tests
-
-# Build release binaries (only source changes trigger this)
-RUN cargo build --release --bin validator-node --bin csudo
-
-# Strip binaries for smaller size
-RUN strip /app/target/release/validator-node /app/target/release/csudo
-
-# Stage 4: Runtime - Minimal production image
-FROM debian:trixie-slim AS runtime
-
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    libssl3t64 \
-    curl \
-    tini \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd -r -u 1000 -m platform
+# Set up cargo-chef for caching
+RUN cargo install cargo-chef --locked
 
 WORKDIR /app
 
-# Copy binaries from builder
-COPY --from=builder /app/target/release/validator-node /usr/local/bin/
-COPY --from=builder /app/target/release/csudo /usr/local/bin/
+# Prepare recipe for caching dependencies
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Cache dependencies
+FROM rust:1.92-bookworm AS cacher
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    cmake \
+    clang \
+    libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN cargo install cargo-chef --locked
+WORKDIR /app
+COPY --from=builder /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+
+# Build stage
+FROM rust:1.92-bookworm AS final-builder
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    cmake \
+    clang \
+    libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=cacher /app/target target
+COPY --from=cacher /usr/local/cargo /usr/local/cargo
+COPY . .
+
+# Build all binaries
+RUN cargo build --release -p platform -p validator-node -p csudo
+
+# Runtime stage (Ubuntu 24.04 for glibc 2.39 compatibility)
+FROM ubuntu:24.04
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3t64 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy binaries
+COPY --from=final-builder /app/target/release/platform /usr/local/bin/platform
+COPY --from=final-builder /app/target/release/validator-node /usr/local/bin/validator-node
+COPY --from=final-builder /app/target/release/csudo /usr/local/bin/csudo
 
 # Create data directory
-RUN mkdir -p /data
+RUN mkdir -p /data && chmod 777 /data
 
-# Environment
-ENV RUST_LOG=info,platform_chain=debug
-ENV DATA_DIR=/data
-
-# Expose ports (RPC: 8080, P2P: 9000)
-EXPOSE 8080 9000
-
-# Use tini as init system
-ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["validator-node", "--data-dir", "/data"]
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -sf http://localhost:8080/health || exit 1
+# Default: run validator-node (reads VALIDATOR_SECRET_KEY from env)
+# Validators can use their existing docker-compose without changes
+ENTRYPOINT ["validator-node"]
+CMD ["--data-dir", "/data", "--platform-server", "https://chain.platform.network"]
 
 # Labels
 LABEL org.opencontainers.image.source="https://github.com/PlatformNetwork/platform"
-LABEL org.opencontainers.image.description="Platform Chain Validator Node"
-LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.description="Platform Network - Unified Server/Validator"
+LABEL org.opencontainers.image.licenses="Apache-2.0"

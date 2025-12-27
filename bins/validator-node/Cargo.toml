@@ -3,6 +3,10 @@ name = "validator-node"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "validator_node"
+path = "src/lib.rs"
+
 [[bin]]
 name = "validator-node"
 path = "src/main.rs"
@@ -20,6 +24,7 @@ platform-rpc = { path = "../../crates/rpc-server" }
 platform-subnet-manager = { path = "../../crates/subnet-manager" }
 challenge-orchestrator = { path = "../../crates/challenge-orchestrator" }
 distributed-db = { path = "../../crates/distributed-db" }
+secure-container-runtime = { path = "../../crates/secure-container-runtime" }
 
 # Challenges are loaded dynamically from ChainState (Docker containers)
 # No hardcoded challenge dependencies

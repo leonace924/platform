@@ -1570,32 +1570,32 @@ impl RpcHandler {
     /// Get challenge container health status for this validator
     fn monitor_get_challenge_health(&self, id: Value) -> JsonRpcResponse {
         let chain = self.chain_state.read();
-        
+
         // Get validator info from first validator in state
         let (hotkey, ss58) = if let Some(v) = chain.validators.values().next() {
             (v.hotkey.to_string(), v.hotkey.to_string())
         } else {
             ("unknown".to_string(), "unknown".to_string())
         };
-        
+
         // Get challenges from state
         let mut challenges = Vec::new();
         let mut healthy_count = 0;
         let mut unhealthy_count = 0;
-        
+
         for (challenge_id, config) in &chain.challenge_configs {
             // Check if we have routes registered for this challenge (indicates it's running)
             let has_routes = self.challenge_routes.read().contains_key(&config.name);
-            
+
             let status = if has_routes { "Running" } else { "Unknown" };
             let health = if has_routes { "Healthy" } else { "Unknown" };
-            
+
             if has_routes {
                 healthy_count += 1;
             } else {
                 unhealthy_count += 1;
             }
-            
+
             challenges.push(json!({
                 "challenge_id": challenge_id.to_string(),
                 "challenge_name": config.name,
@@ -1607,9 +1607,9 @@ impl RpcHandler {
                 "endpoint": format!("http://challenge-{}:8080", config.name)
             }));
         }
-        
+
         let total_challenges = challenges.len();
-        
+
         JsonRpcResponse::result(
             id,
             json!({

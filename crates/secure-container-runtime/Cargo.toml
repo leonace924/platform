@@ -34,6 +34,12 @@ chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 hex = "0.4"
 
+# WebSocket support
+tokio-tungstenite = "0.24"
+
+# JWT authentication
+jsonwebtoken = "9"
+
 # Logging (for binary)
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

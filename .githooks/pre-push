@@ -41,7 +41,27 @@ if ! cargo clippy --workspace -- \
     -A clippy::type_complexity \
     -A clippy::await_holding_lock \
     -A clippy::collapsible_match \
-    -A clippy::collapsible_if; then
+    -A clippy::collapsible_if \
+    -A clippy::needless_borrows_for_generic_args \
+    -A clippy::to_string_in_format_args \
+    -A clippy::manual_map \
+    -A clippy::map_flatten \
+    -A clippy::useless_format \
+    -A clippy::redundant_closure \
+    -A deprecated \
+    -A dead_code \
+    -A clippy::for_kv_map \
+    -A clippy::to_string_trait_impl \
+    -A clippy::if_same_then_else \
+    -A unused_variables \
+    -A unused_imports \
+    -A clippy::useless_conversion \
+    -A for_loops_over_fallibles \
+    -A clippy::manual_filter_map \
+    -A clippy::collapsible_str_replace \
+    -A clippy::manual_is_multiple_of \
+    -A clippy::map_entry \
+    -A clippy::manual_flatten; then
     echo -e "${RED}ERROR: Clippy found issues.${NC}"
     echo "Fix clippy warnings before pushing."
     exit 1

@@ -2,15 +2,28 @@
 name = "platform-challenge-sdk"
 version.workspace = true
 edition.workspace = true
-description = "SDK for developing challenges on Mini-Chain"
+description = "SDK for developing challenges on Platform Network"
+
+[features]
+default = []
+# Enable HTTP server mode (requires axum)
+http-server = ["axum", "tower", "tower-http"]
+# Legacy P2P support (deprecated)
+p2p = []
 
 [dependencies]
 platform-core = { path = "../core" }
 
 # Async
 tokio = { workspace = true }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 async-trait = { workspace = true }
 futures = { workspace = true }
+
+# Web server (optional, for http-server feature)
+axum = { version = "0.7", features = ["ws", "json"], optional = true }
+tower = { version = "0.5", optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
 
 # Serialization
 serde = { workspace = true }

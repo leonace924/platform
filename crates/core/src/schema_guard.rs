@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 pub trait SchemaHash {
     /// Returns a deterministic hash of the struct's schema
     fn schema_hash() -> u64;
-    
+
     /// Returns human-readable schema description for debugging
     fn schema_description() -> String;
 }
@@ -50,7 +50,7 @@ impl SchemaHash for crate::ValidatorInfo {
         // Hash is computed from: struct_name + field_name:type pairs in order
         const_hash("ValidatorInfo:hotkey:Hotkey,stake:Stake,is_active:bool,last_seen:DateTime,peer_id:Option<String>,x25519_pubkey:Option<String>")
     }
-    
+
     fn schema_description() -> String {
         "ValidatorInfo { hotkey: Hotkey, stake: Stake, is_active: bool, last_seen: DateTime<Utc>, peer_id: Option<String>, x25519_pubkey: Option<String> }".to_string()
     }
@@ -61,7 +61,7 @@ impl SchemaHash for crate::ChainState {
     fn schema_hash() -> u64 {
         const_hash("ChainState:block_height:u64,epoch:u64,config:NetworkConfig,sudo_key:Hotkey,validators:HashMap<Hotkey,ValidatorInfo>,challenges:HashMap<ChallengeId,Challenge>,challenge_configs:HashMap,mechanism_configs:HashMap,challenge_weights:HashMap,required_version:Option,pending_jobs:Vec,state_hash:[u8;32],last_updated:DateTime,registered_hotkeys:HashSet<Hotkey>")
     }
-    
+
     fn schema_description() -> String {
         "ChainState { block_height, epoch, config, sudo_key, validators, challenges, challenge_configs, mechanism_configs, challenge_weights, required_version, pending_jobs, state_hash, last_updated, registered_hotkeys }".to_string()
     }
@@ -72,13 +72,13 @@ impl SchemaHash for crate::ChainState {
 // ============================================================================
 
 /// Registry of expected schema hashes for each version
-/// 
+///
 /// WHEN ADDING A NEW VERSION:
 /// 1. Add entry for new version with current schema hashes
 /// 2. Keep old version entries for migration testing
 pub fn expected_schema_hashes() -> BTreeMap<u32, SchemaRegistry> {
     let mut registry = BTreeMap::new();
-    
+
     // Version 1: Original schema (no registered_hotkeys, no x25519_pubkey)
     registry.insert(1, SchemaRegistry {
         version: 1,
@@ -86,7 +86,7 @@ pub fn expected_schema_hashes() -> BTreeMap<u32, SchemaRegistry> {
         chain_state_hash: const_hash("ChainState:block_height:u64,epoch:u64,config:NetworkConfig,sudo_key:Hotkey,validators:HashMap<Hotkey,ValidatorInfo>,challenges:HashMap<ChallengeId,Challenge>,challenge_configs:HashMap,mechanism_configs:HashMap,challenge_weights:HashMap,required_version:Option,pending_jobs:Vec,state_hash:[u8;32],last_updated:DateTime"),
         description: "Original schema without registered_hotkeys or x25519_pubkey",
     });
-    
+
     // Version 2: Added registered_hotkeys to ChainState
     registry.insert(2, SchemaRegistry {
         version: 2,
@@ -94,7 +94,7 @@ pub fn expected_schema_hashes() -> BTreeMap<u32, SchemaRegistry> {
         chain_state_hash: const_hash("ChainState:block_height:u64,epoch:u64,config:NetworkConfig,sudo_key:Hotkey,validators:HashMap<Hotkey,ValidatorInfo>,challenges:HashMap<ChallengeId,Challenge>,challenge_configs:HashMap,mechanism_configs:HashMap,challenge_weights:HashMap,required_version:Option,pending_jobs:Vec,state_hash:[u8;32],last_updated:DateTime,registered_hotkeys:HashSet<Hotkey>"),
         description: "Added registered_hotkeys to ChainState",
     });
-    
+
     // Version 3: Added x25519_pubkey to ValidatorInfo
     registry.insert(3, SchemaRegistry {
         version: 3,
@@ -102,7 +102,7 @@ pub fn expected_schema_hashes() -> BTreeMap<u32, SchemaRegistry> {
         chain_state_hash: const_hash("ChainState:block_height:u64,epoch:u64,config:NetworkConfig,sudo_key:Hotkey,validators:HashMap<Hotkey,ValidatorInfo>,challenges:HashMap<ChallengeId,Challenge>,challenge_configs:HashMap,mechanism_configs:HashMap,challenge_weights:HashMap,required_version:Option,pending_jobs:Vec,state_hash:[u8;32],last_updated:DateTime,registered_hotkeys:HashSet<Hotkey>"),
         description: "Added x25519_pubkey to ValidatorInfo",
     });
-    
+
     registry
 }
 
@@ -120,26 +120,27 @@ pub struct SchemaRegistry {
 // ============================================================================
 
 /// Verify that current schema matches expected for current version
-/// 
+///
 /// This function should be called at startup and in tests.
 /// It will panic if schema doesn't match, preventing data corruption.
 pub fn verify_schema_integrity() -> Result<(), SchemaError> {
     use crate::state_versioning::CURRENT_STATE_VERSION;
-    
+
     let registry = expected_schema_hashes();
-    
+
     // Get expected hashes for current version
-    let expected = registry.get(&CURRENT_STATE_VERSION).ok_or_else(|| {
-        SchemaError::MissingVersion {
-            version: CURRENT_STATE_VERSION,
-            hint: format!(
-                "Version {} is not registered in schema_guard.rs. \
+    let expected =
+        registry
+            .get(&CURRENT_STATE_VERSION)
+            .ok_or_else(|| SchemaError::MissingVersion {
+                version: CURRENT_STATE_VERSION,
+                hint: format!(
+                    "Version {} is not registered in schema_guard.rs. \
                 Add an entry to expected_schema_hashes() with the current schema hashes.",
-                CURRENT_STATE_VERSION
-            ),
-        }
-    })?;
-    
+                    CURRENT_STATE_VERSION
+                ),
+            })?;
+
     // Verify ValidatorInfo schema
     let actual_validator_hash = <crate::ValidatorInfo as SchemaHash>::schema_hash();
     if actual_validator_hash != expected.validator_info_hash {
@@ -163,7 +164,7 @@ pub fn verify_schema_integrity() -> Result<(), SchemaError> {
             ),
         });
     }
-    
+
     // Verify ChainState schema
     let actual_state_hash = <crate::ChainState as SchemaHash>::schema_hash();
     if actual_state_hash != expected.chain_state_hash {
@@ -187,17 +188,17 @@ pub fn verify_schema_integrity() -> Result<(), SchemaError> {
             ),
         });
     }
-    
+
     Ok(())
 }
 
 /// Verify that all migration paths exist and work
 pub fn verify_migration_paths() -> Result<(), SchemaError> {
     use crate::state_versioning::{CURRENT_STATE_VERSION, MIN_SUPPORTED_VERSION};
-    
+
     // Ensure we have registry entries for all supported versions
     let registry = expected_schema_hashes();
-    
+
     for version in MIN_SUPPORTED_VERSION..=CURRENT_STATE_VERSION {
         if !registry.contains_key(&version) {
             return Err(SchemaError::MissingVersion {
@@ -210,7 +211,7 @@ pub fn verify_migration_paths() -> Result<(), SchemaError> {
             });
         }
     }
-    
+
     Ok(())
 }
 
@@ -236,7 +237,13 @@ pub enum SchemaError {
 impl std::fmt::Display for SchemaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SchemaError::SchemaMismatch { type_name, expected_hash, actual_hash, current_version, hint } => {
+            SchemaError::SchemaMismatch {
+                type_name,
+                expected_hash,
+                actual_hash,
+                current_version,
+                hint,
+            } => {
                 write!(
                     f,
                     "\n\
@@ -250,8 +257,13 @@ impl std::fmt::Display for SchemaError {
                     ╠══════════════════════════════════════════════════════════════════╣\n\
                     ║ {}║\n\
                     ╚══════════════════════════════════════════════════════════════════╝",
-                    type_name, current_version, expected_hash, actual_hash,
-                    hint.lines().map(|l| format!("{:<64}\n║ ", l)).collect::<String>()
+                    type_name,
+                    current_version,
+                    expected_hash,
+                    actual_hash,
+                    hint.lines()
+                        .map(|l| format!("{:<64}\n║ ", l))
+                        .collect::<String>()
                 )
             }
             SchemaError::MissingVersion { version, hint } => {
@@ -266,7 +278,9 @@ impl std::fmt::Display for SchemaError {
                     ║ {}║\n\
                     ╚══════════════════════════════════════════════════════════════════╝",
                     version,
-                    hint.lines().map(|l| format!("{:<64}\n║ ", l)).collect::<String>()
+                    hint.lines()
+                        .map(|l| format!("{:<64}\n║ ", l))
+                        .collect::<String>()
                 )
             }
         }
@@ -282,7 +296,7 @@ impl std::error::Error for SchemaError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     /// This test ENFORCES schema integrity.
     /// If you change a serializable struct, this test will fail
     /// and tell you exactly what to do.
@@ -292,7 +306,7 @@ mod tests {
             panic!("{}", e);
         }
     }
-    
+
     /// Verify all migration paths are registered
     #[test]
     fn test_migration_paths_registered() {
@@ -300,7 +314,7 @@ mod tests {
             panic!("{}", e);
         }
     }
-    
+
     /// Test that schema hashes are deterministic
     #[test]
     fn test_schema_hash_deterministic() {
@@ -308,49 +322,52 @@ mod tests {
         let hash2 = <crate::ValidatorInfo as SchemaHash>::schema_hash();
         assert_eq!(hash1, hash2, "Schema hash must be deterministic");
     }
-    
+
     /// Verify current version has correct hashes
     #[test]
     fn test_current_version_hashes() {
         use crate::state_versioning::CURRENT_STATE_VERSION;
-        
+
         let registry = expected_schema_hashes();
-        let current = registry.get(&CURRENT_STATE_VERSION)
+        let current = registry
+            .get(&CURRENT_STATE_VERSION)
             .expect("Current version must have registry entry");
-        
+
         assert_eq!(
             current.validator_info_hash,
             <crate::ValidatorInfo as SchemaHash>::schema_hash(),
-            "ValidatorInfo hash mismatch for version {}", CURRENT_STATE_VERSION
+            "ValidatorInfo hash mismatch for version {}",
+            CURRENT_STATE_VERSION
         );
-        
+
         assert_eq!(
             current.chain_state_hash,
             <crate::ChainState as SchemaHash>::schema_hash(),
-            "ChainState hash mismatch for version {}", CURRENT_STATE_VERSION
+            "ChainState hash mismatch for version {}",
+            CURRENT_STATE_VERSION
         );
     }
-    
+
     /// Test roundtrip serialization for current version
     #[test]
     fn test_current_version_serialization() {
-        use crate::{ChainState, ValidatorInfo, Stake, NetworkConfig};
         use crate::crypto::Keypair;
-        
+        use crate::{ChainState, NetworkConfig, Stake, ValidatorInfo};
+
         // Create state with validators
         let sudo = Keypair::generate();
         let mut state = ChainState::new(sudo.hotkey(), NetworkConfig::default());
-        
+
         for _ in 0..3 {
             let kp = Keypair::generate();
             let info = ValidatorInfo::new(kp.hotkey(), Stake::new(1_000_000_000));
             state.add_validator(info).unwrap();
         }
-        
+
         // Serialize and deserialize
         let data = crate::state_versioning::serialize_state_versioned(&state).unwrap();
         let loaded = crate::state_versioning::deserialize_state_smart(&data).unwrap();
-        
+
         assert_eq!(state.validators.len(), loaded.validators.len());
         assert_eq!(state.block_height, loaded.block_height);
     }

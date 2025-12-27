@@ -57,6 +57,7 @@ pub mod client;
 pub mod policy;
 pub mod protocol;
 pub mod types;
+pub mod ws_transport;
 
 pub use broker::ContainerBroker;
 pub use client::{
@@ -66,3 +67,4 @@ pub use client::{
 pub use policy::SecurityPolicy;
 pub use protocol::{Request, Response};
 pub use types::*;
+pub use ws_transport::{generate_token, run_ws_server, WsClaims, WsConfig};
