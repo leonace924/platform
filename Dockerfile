@@ -15,6 +15,8 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     protobuf-compiler \
     cmake \
+    clang \
+    libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set up cargo-chef for caching
@@ -33,6 +35,8 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     protobuf-compiler \
     cmake \
+    clang \
+    libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 RUN cargo install cargo-chef --locked
 WORKDIR /app
@@ -46,6 +50,8 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     protobuf-compiler \
     cmake \
+    clang \
+    libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
