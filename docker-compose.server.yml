@@ -1,29 +1,16 @@
 version: "3.8"
 
-services:
-  # ==========================================================================
-  # PostgreSQL Database
-  # ==========================================================================
-  postgres:
-    image: postgres:15
-    container_name: platform-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-platformsecret}
-      POSTGRES_DB: platform_server
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    networks:
-      - platform-internal
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+# ==========================================================================
+# Platform Server Deployment
+# ==========================================================================
+# Usage:
+#   DATABASE_URL="postgresql://user:pass@host:5432/db" docker compose -f docker-compose.server.yml up -d
+#
+# Example with Supabase:
+#   DATABASE_URL="postgresql://postgres:PASSWORD@db.xxx.supabase.co:5432/postgres" docker compose -f docker-compose.server.yml up -d
+# ==========================================================================
 
-  # ==========================================================================
-  # Platform Server (Central Orchestration)
-  # ==========================================================================
+services:
   platform-server:
     image: ghcr.io/platformnetwork/platform:latest
     container_name: platform-server
@@ -37,13 +24,9 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      - DATABASE_URL=postgres://postgres:${DB_PASSWORD:-platformsecret}@postgres:5432/platform_server
+      - DATABASE_URL=${DATABASE_URL}
       - RUST_LOG=info,platform_server=debug
-    depends_on:
-      postgres:
-        condition: service_healthy
     networks:
-      - platform-internal
       - platform-challenges
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
@@ -51,13 +34,7 @@ services:
       timeout: 10s
       retries: 3
 
-volumes:
-  postgres-data:
-    driver: local
-
 networks:
-  platform-internal:
-    driver: bridge
   platform-challenges:
     driver: bridge
     name: platform-challenges
