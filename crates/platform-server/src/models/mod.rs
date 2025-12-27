@@ -284,6 +284,15 @@ pub enum WsEvent {
     #[serde(rename = "challenge_updated")]
     ChallengeUpdated(ChallengeUpdateEvent),
 
+    #[serde(rename = "challenge_registered")]
+    ChallengeRegistered(ChallengeRegisteredEvent),
+
+    #[serde(rename = "challenge_started")]
+    ChallengeStarted(ChallengeStartedEvent),
+
+    #[serde(rename = "challenge_stopped")]
+    ChallengeStopped(ChallengeStoppedEvent),
+
     #[serde(rename = "validator_joined")]
     ValidatorJoined(ValidatorEvent),
 
@@ -336,6 +345,26 @@ pub struct ChallengeUpdateEvent {
     pub old_value: Option<String>,
     pub new_value: String,
     pub updated_by: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChallengeRegisteredEvent {
+    pub id: String,
+    pub name: String,
+    pub docker_image: String,
+    pub mechanism_id: u8,
+    pub emission_weight: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChallengeStartedEvent {
+    pub id: String,
+    pub endpoint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChallengeStoppedEvent {
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

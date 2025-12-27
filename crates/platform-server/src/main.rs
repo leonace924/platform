@@ -317,6 +317,19 @@ async fn register_challenge(
         challenge.id, challenge.docker_image
     );
 
+    // Broadcast to all connected validators
+    state
+        .broadcast_event(models::WsEvent::ChallengeRegistered(
+            models::ChallengeRegisteredEvent {
+                id: challenge.id.clone(),
+                name: challenge.name.clone(),
+                docker_image: challenge.docker_image.clone(),
+                mechanism_id: challenge.mechanism_id,
+                emission_weight: challenge.emission_weight,
+            },
+        ))
+        .await;
+
     Ok(Json(serde_json::json!({
         "success": true,
         "challenge_id": req.id
@@ -342,6 +355,16 @@ async fn start_challenge(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // Broadcast to validators
+    state
+        .broadcast_event(models::WsEvent::ChallengeStarted(
+            models::ChallengeStartedEvent {
+                id: id.clone(),
+                endpoint: endpoint.clone(),
+            },
+        ))
+        .await;
+
     Ok(Json(serde_json::json!({
         "success": true,
         "endpoint": endpoint
@@ -361,6 +384,13 @@ async fn stop_challenge(
         .stop_challenge(&id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Broadcast to validators
+    state
+        .broadcast_event(models::WsEvent::ChallengeStopped(
+            models::ChallengeStoppedEvent { id: id.clone() },
+        ))
+        .await;
 
     Ok(Json(serde_json::json!({ "success": true })))
 }
