@@ -141,6 +141,12 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         .route("/api/v1/data/results", post(data_api::write_result))
         .route("/api/v1/data/results", get(data_api::get_results))
         .route("/api/v1/data/snapshot", get(data_api::get_snapshot))
+        // Bridge API - Generic proxy to challenge containers
+        .route("/api/v1/bridge", get(api::bridge::list_bridges))
+        .route(
+            "/api/v1/bridge/:challenge/*path",
+            any(api::bridge::bridge_to_challenge),
+        )
         // Submissions API
         .route(
             "/api/v1/submissions",
@@ -176,6 +182,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     info!("╠══════════════════════════════════════════════════════════════╣");
     info!("║  Challenges:    /api/v1/challenges                          ║");
     info!("║  Challenge API: /api/v1/challenges/{{id}}/*                   ║");
+    info!("║  Bridge API:    /api/v1/bridge/{{challenge}}/*                ║");
     info!("║  Data API:      /api/v1/data/{{tasks,results,snapshot}}      ║");
     info!(
         "║  WebSocket:     ws://{}:{}                             ║",
