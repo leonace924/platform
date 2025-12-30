@@ -41,6 +41,39 @@ impl PlatformServerClient {
         }
     }
 
+    /// Health check with infinite retry loop (30s interval)
+    pub async fn health_with_retry(&self) -> bool {
+        let mut attempt = 0u64;
+        loop {
+            attempt += 1;
+            match self
+                .client
+                .get(format!("{}/health", self.base_url))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => {
+                    info!("Platform server connected (attempt {})", attempt);
+                    return true;
+                }
+                Ok(r) => {
+                    warn!(
+                        "Platform server health check failed: {} (attempt {}, retrying in 30s)",
+                        r.status(),
+                        attempt
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Platform server not reachable: {} (attempt {}, retrying in 30s)",
+                        e, attempt
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    }
+
     pub async fn health(&self) -> bool {
         self.client
             .get(format!("{}/health", self.base_url))
@@ -50,42 +83,96 @@ impl PlatformServerClient {
             .unwrap_or(false)
     }
 
+    /// List challenges with infinite retry loop (30s interval)
     pub async fn list_challenges(&self) -> Result<Vec<ChallengeInfo>> {
-        Ok(self
-            .client
-            .get(format!("{}/api/v1/challenges", self.base_url))
-            .send()
-            .await?
-            .json()
-            .await?)
+        let url = format!("{}/api/v1/challenges", self.base_url);
+        let mut attempt = 0u64;
+        loop {
+            attempt += 1;
+            match self.client.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<Vec<ChallengeInfo>>().await {
+                        Ok(challenges) => return Ok(challenges),
+                        Err(e) => {
+                            warn!(
+                                "Failed to parse challenges response: {} (attempt {}, retrying in 30s)",
+                                e, attempt
+                            );
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    warn!(
+                        "Failed to list challenges: {} (attempt {}, retrying in 30s)",
+                        resp.status(),
+                        attempt
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Platform server not reachable: {} (attempt {}, retrying in 30s)",
+                        e, attempt
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
     }
 
+    /// Get weights with infinite retry loop (30s interval)
     pub async fn get_weights(&self, challenge_id: &str, epoch: u64) -> Result<Vec<(u16, u16)>> {
-        let resp: serde_json::Value = self
-            .client
-            .get(format!(
-                "{}/api/v1/challenges/{}/get_weights?epoch={}",
-                self.base_url, challenge_id, epoch
-            ))
-            .send()
-            .await?
-            .json()
-            .await?;
-
-        Ok(resp
-            .get("weights")
-            .and_then(|w| w.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|w| {
-                        Some((
-                            w.get("uid")?.as_u64()? as u16,
-                            w.get("weight")?.as_u64()? as u16,
-                        ))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
+        let url = format!(
+            "{}/api/v1/challenges/{}/get_weights?epoch={}",
+            self.base_url, challenge_id, epoch
+        );
+        let mut attempt = 0u64;
+        loop {
+            attempt += 1;
+            match self.client.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(data) => {
+                            let weights = data
+                                .get("weights")
+                                .and_then(|w| w.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|w| {
+                                            Some((
+                                                w.get("uid")?.as_u64()? as u16,
+                                                w.get("weight")?.as_u64()? as u16,
+                                            ))
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            return Ok(weights);
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to parse weights response: {} (attempt {}, retrying in 30s)",
+                                e, attempt
+                            );
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    warn!(
+                        "Failed to get weights for {}: {} (attempt {}, retrying in 30s)",
+                        challenge_id,
+                        resp.status(),
+                        attempt
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Platform server not reachable: {} (attempt {}, retrying in 30s)",
+                        e, attempt
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
     }
 }
 
@@ -190,15 +277,10 @@ async fn main() -> Result<()> {
     )));
     let bans = Arc::new(RwLock::new(BanList::default()));
 
-    // Platform server
+    // Platform server - wait until connected (infinite retry)
     let platform_client = Arc::new(PlatformServerClient::new(&args.platform_server));
     info!("Platform server: {}", args.platform_server);
-
-    if platform_client.health().await {
-        info!("Platform server: connected");
-    } else {
-        warn!("Platform server: not reachable (will retry)");
-    }
+    platform_client.health_with_retry().await;
 
     // List challenges
     match platform_client.list_challenges().await {
