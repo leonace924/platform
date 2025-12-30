@@ -6,6 +6,7 @@
 use anyhow::Result;
 use challenge_orchestrator::{ChallengeOrchestrator, OrchestratorConfig};
 use clap::Parser;
+use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
 use platform_bittensor::{
     signer_from_seed, sync_metagraph, BittensorClient, BittensorSigner, BlockSync, BlockSyncConfig,
@@ -16,10 +17,12 @@ use platform_rpc::{RpcConfig, RpcServer};
 use platform_storage::Storage;
 use platform_subnet_manager::BanList;
 use secure_container_runtime::{run_ws_server, ContainerBroker, SecurityPolicy, WsConfig};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
 // ==================== Platform Server Client ====================
@@ -185,6 +188,40 @@ pub struct ChallengeInfo {
     #[allow(dead_code)]
     pub emission_weight: f64,
     pub is_healthy: bool,
+}
+
+// ==================== WebSocket Events ====================
+
+/// WebSocket event from platform-server
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum WsEvent {
+    #[serde(rename = "challenge_event")]
+    ChallengeEvent(ChallengeCustomEvent),
+    #[serde(rename = "ping")]
+    Ping,
+    #[serde(other)]
+    Other,
+}
+
+/// Custom event from a challenge
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ChallengeCustomEvent {
+    pub challenge_id: String,
+    pub event_name: String,
+    pub payload: serde_json::Value,
+    pub timestamp: i64,
+}
+
+/// Payload for new_submission event from term-challenge
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct NewSubmissionPayload {
+    pub submission_id: String,
+    pub agent_hash: String,
+    pub miner_hotkey: String,
+    pub source_code: String,
+    pub name: Option<String>,
+    pub epoch: i64,
 }
 
 // ==================== CLI ====================
@@ -366,6 +403,25 @@ async fn main() -> Result<()> {
             });
         }
     }
+
+    // Build challenge URL map for WebSocket event handler
+    // Maps challenge_id -> local container URL (e.g., "term-challenge" -> "http://term-challenge:8080")
+    let challenge_urls: Arc<RwLock<HashMap<String, String>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+    for ch in &challenges {
+        let url = format!("http://{}:8080", ch.id);
+        challenge_urls.write().insert(ch.id.clone(), url.clone());
+        info!("Challenge URL registered: {} -> {}", ch.id, url);
+    }
+
+    // Start WebSocket listener for platform-server events
+    // This listens for new_submission events and triggers local evaluation
+    let ws_platform_url = args.platform_server.clone();
+    let ws_validator_hotkey = keypair.ss58_address();
+    let ws_challenge_urls = challenge_urls.clone();
+    tokio::spawn(async move {
+        start_websocket_listener(ws_platform_url, ws_validator_hotkey, ws_challenge_urls).await;
+    });
 
     // RPC server
     let addr: SocketAddr = format!("{}:{}", args.rpc_addr, args.rpc_port).parse()?;
@@ -654,5 +710,320 @@ async fn handle_block_event(
 
         BlockSyncEvent::Disconnected(e) => warn!("Bittensor disconnected: {}", e),
         BlockSyncEvent::Reconnected => info!("Bittensor reconnected"),
+    }
+}
+
+// ==================== WebSocket Event Listener ====================
+
+/// Start WebSocket listener for platform-server events
+/// Listens for challenge events and triggers evaluations
+pub async fn start_websocket_listener(
+    platform_url: String,
+    validator_hotkey: String,
+    challenge_urls: Arc<RwLock<HashMap<String, String>>>,
+) {
+    // Convert HTTP URL to WebSocket URL
+    let ws_url = platform_url
+        .replace("https://", "wss://")
+        .replace("http://", "ws://")
+        + "/ws";
+
+    info!("Starting WebSocket listener: {}", ws_url);
+
+    loop {
+        match connect_to_websocket(&ws_url, &validator_hotkey, challenge_urls.clone()).await {
+            Ok(()) => {
+                info!("WebSocket connection closed, reconnecting in 5s...");
+            }
+            Err(e) => {
+                warn!("WebSocket error: {}, reconnecting in 30s...", e);
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                continue;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+async fn connect_to_websocket(
+    ws_url: &str,
+    validator_hotkey: &str,
+    challenge_urls: Arc<RwLock<HashMap<String, String>>>,
+) -> Result<()> {
+    let (ws_stream, _) = connect_async(ws_url).await?;
+    let (mut write, mut read) = ws_stream.split();
+
+    info!("WebSocket connected to platform-server");
+
+    // Send ping periodically to keep connection alive
+    let ping_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if write.send(Message::Ping(vec![])).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Process incoming messages
+    while let Some(msg) = read.next().await {
+        match msg {
+            Ok(Message::Text(text)) => match serde_json::from_str::<WsEvent>(&text) {
+                Ok(WsEvent::ChallengeEvent(event)) => {
+                    handle_challenge_event(event, validator_hotkey, challenge_urls.clone()).await;
+                }
+                Ok(WsEvent::Ping) => {
+                    debug!("Received ping from server");
+                }
+                Ok(WsEvent::Other) => {
+                    debug!("Received other event");
+                }
+                Err(e) => {
+                    debug!("Failed to parse WebSocket message: {}", e);
+                }
+            },
+            Ok(Message::Ping(_)) => {
+                debug!("Received ping");
+            }
+            Ok(Message::Close(_)) => {
+                info!("WebSocket closed by server");
+                break;
+            }
+            Err(e) => {
+                warn!("WebSocket receive error: {}", e);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    ping_task.abort();
+    Ok(())
+}
+
+/// Handle challenge-specific events
+async fn handle_challenge_event(
+    event: ChallengeCustomEvent,
+    validator_hotkey: &str,
+    challenge_urls: Arc<RwLock<HashMap<String, String>>>,
+) {
+    info!(
+        "Challenge event: {}:{} (ts: {})",
+        event.challenge_id, event.event_name, event.timestamp
+    );
+
+    // Handle new_submission events - trigger evaluation
+    if event.event_name == "new_submission" {
+        match serde_json::from_value::<NewSubmissionPayload>(event.payload.clone()) {
+            Ok(submission) => {
+                info!(
+                    "New submission: agent={} from={}",
+                    &submission.agent_hash[..16.min(submission.agent_hash.len())],
+                    &submission.miner_hotkey[..16.min(submission.miner_hotkey.len())]
+                );
+
+                // Get challenge container URL
+                let challenge_url = {
+                    let urls = challenge_urls.read();
+                    urls.get(&event.challenge_id).cloned()
+                };
+
+                if let Some(url) = challenge_url {
+                    // Spawn evaluation task
+                    let hotkey = validator_hotkey.to_string();
+                    let challenge_id = event.challenge_id.clone();
+                    tokio::spawn(async move {
+                        evaluate_and_submit(&url, &challenge_id, submission, &hotkey).await;
+                    });
+                } else {
+                    warn!("No local container for challenge: {}", event.challenge_id);
+                }
+            }
+            Err(e) => {
+                warn!("Failed to parse new_submission payload: {}", e);
+            }
+        }
+    }
+}
+
+/// Evaluate agent locally and submit result to central server
+async fn evaluate_and_submit(
+    challenge_url: &str,
+    challenge_id: &str,
+    submission: NewSubmissionPayload,
+    validator_hotkey: &str,
+) {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3600))
+        .build()
+        .unwrap_or_default();
+
+    info!(
+        "Evaluating agent {} via local container {}",
+        &submission.agent_hash[..16.min(submission.agent_hash.len())],
+        challenge_url
+    );
+
+    // Call local challenge container /evaluate endpoint
+    let eval_request = serde_json::json!({
+        "submission_id": submission.submission_id,
+        "agent_hash": submission.agent_hash,
+        "miner_hotkey": submission.miner_hotkey,
+        "validator_hotkey": validator_hotkey,
+        "name": submission.name,
+        "source_code": submission.source_code,
+        "epoch": submission.epoch,
+    });
+
+    match client
+        .post(format!("{}/evaluate", challenge_url))
+        .json(&eval_request)
+        .send()
+        .await
+    {
+        Ok(response) => {
+            if response.status().is_success() {
+                match response.json::<serde_json::Value>().await {
+                    Ok(result) => {
+                        let score = result["score"].as_f64().unwrap_or(0.0);
+                        let tasks_passed = result["tasks_passed"].as_i64().unwrap_or(0);
+                        let tasks_total = result["tasks_total"].as_i64().unwrap_or(0);
+                        let tasks_failed = result["tasks_failed"].as_i64().unwrap_or(0);
+                        let total_cost = result["total_cost_usd"].as_f64().unwrap_or(0.0);
+
+                        info!(
+                            "Evaluation complete for {}: score={:.2}%, passed={}/{}",
+                            &submission.agent_hash[..16.min(submission.agent_hash.len())],
+                            score * 100.0,
+                            tasks_passed,
+                            tasks_total
+                        );
+
+                        // Submit result to central server
+                        submit_evaluation_result(
+                            challenge_id,
+                            &submission.agent_hash,
+                            validator_hotkey,
+                            score,
+                            tasks_passed as i32,
+                            tasks_total as i32,
+                            tasks_failed as i32,
+                            total_cost,
+                            submission.epoch,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse evaluation response: {}", e);
+                    }
+                }
+            } else {
+                warn!(
+                    "Evaluation failed for {}: {}",
+                    &submission.agent_hash[..16.min(submission.agent_hash.len())],
+                    response.status()
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                "Evaluation request failed for {}: {}",
+                &submission.agent_hash[..16.min(submission.agent_hash.len())],
+                e
+            );
+        }
+    }
+}
+
+/// Submit evaluation result to central challenge server via bridge
+async fn submit_evaluation_result(
+    challenge_id: &str,
+    agent_hash: &str,
+    validator_hotkey: &str,
+    score: f64,
+    tasks_passed: i32,
+    tasks_total: i32,
+    tasks_failed: i32,
+    total_cost_usd: f64,
+    epoch: i64,
+) {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    // Create signature message: submit_result:{agent_hash}:{timestamp}
+    // Note: In production, this should be signed with the validator's key
+    let _message = format!("submit_result:{}:{}", agent_hash, timestamp);
+    // TODO: Implement proper signing with validator keypair
+    let signature = "validator_signature_placeholder";
+
+    let result_request = serde_json::json!({
+        "agent_hash": agent_hash,
+        "validator_hotkey": validator_hotkey,
+        "score": score,
+        "tasks_passed": tasks_passed,
+        "tasks_total": tasks_total,
+        "tasks_failed": tasks_failed,
+        "total_cost_usd": total_cost_usd,
+        "epoch": epoch,
+        "timestamp": timestamp,
+        "signature": signature,
+    });
+
+    // Submit via bridge to central challenge server
+    let url = format!(
+        "https://chain.platform.network/api/v1/bridge/{}/api/v1/validator/submit_result",
+        challenge_id
+    );
+
+    match client.post(&url).json(&result_request).send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                match response.json::<serde_json::Value>().await {
+                    Ok(result) => {
+                        let success = result["success"].as_bool().unwrap_or(false);
+                        let consensus = result["consensus_reached"].as_bool().unwrap_or(false);
+                        let validators = result["validators_completed"].as_i64().unwrap_or(0);
+                        let total = result["total_validators"].as_i64().unwrap_or(0);
+
+                        if success {
+                            info!(
+                                "Result submitted for {}: {}/{} validators, consensus={}",
+                                &agent_hash[..16.min(agent_hash.len())],
+                                validators,
+                                total,
+                                consensus
+                            );
+                        } else {
+                            let error = result["error"].as_str().unwrap_or("unknown");
+                            warn!("Result submission failed: {}", error);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse submit_result response: {}", e);
+                    }
+                }
+            } else {
+                warn!(
+                    "Result submission failed for {}: {}",
+                    &agent_hash[..16.min(agent_hash.len())],
+                    response.status()
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                "Result submission request failed for {}: {}",
+                &agent_hash[..16.min(agent_hash.len())],
+                e
+            );
+        }
     }
 }

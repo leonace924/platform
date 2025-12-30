@@ -45,3 +45,8 @@ hex = { workspace = true }
 parking_lot = { workspace = true }
 sp-core = { workspace = true }
 uuid = { version = "1.0", features = ["v5"] }
+
+# WebSocket for platform-server events
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+url = "2.5"
