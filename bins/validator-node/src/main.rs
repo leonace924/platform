@@ -282,21 +282,6 @@ async fn main() -> Result<()> {
     info!("Platform server: {}", args.platform_server);
     platform_client.health_with_retry().await;
 
-    // List challenges
-    match platform_client.list_challenges().await {
-        Ok(c) if !c.is_empty() => {
-            info!("Challenges:");
-            for ch in &c {
-                info!(
-                    "  - {} (mechanism={}, healthy={})",
-                    ch.id, ch.mechanism_id, ch.is_healthy
-                );
-            }
-        }
-        Ok(_) => info!("No challenges yet"),
-        Err(e) => warn!("Failed to list challenges: {}", e),
-    }
-
     // Container broker
     info!("Container broker on port {}...", args.broker_port);
     let broker = Arc::new(ContainerBroker::with_policy(SecurityPolicy::default()).await?);
@@ -314,7 +299,7 @@ async fn main() -> Result<()> {
     });
 
     // Challenge orchestrator
-    let _orchestrator = if args.docker_challenges {
+    let orchestrator = if args.docker_challenges {
         match ChallengeOrchestrator::new(OrchestratorConfig {
             network_name: "platform-network".to_string(),
             health_check_interval: Duration::from_secs(30),
@@ -332,6 +317,55 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // List challenges and start containers
+    let challenges = platform_client.list_challenges().await?;
+    if challenges.is_empty() {
+        info!("No challenges registered on platform-server");
+    } else {
+        info!("Challenges from platform-server:");
+        for ch in &challenges {
+            info!(
+                "  - {} (mechanism={}, healthy={})",
+                ch.id, ch.mechanism_id, ch.is_healthy
+            );
+        }
+
+        // Start challenge containers
+        if let Some(ref orch) = orchestrator {
+            for ch in &challenges {
+                let docker_image = format!("ghcr.io/platformnetwork/{}:latest", ch.id);
+                // Generate a deterministic UUID from challenge name
+                let challenge_uuid =
+                    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, ch.id.as_bytes());
+                let config = challenge_orchestrator::ChallengeContainerConfig {
+                    challenge_id: platform_core::ChallengeId(challenge_uuid),
+                    name: ch.id.clone(),
+                    docker_image,
+                    mechanism_id: ch.mechanism_id as u8,
+                    emission_weight: ch.emission_weight,
+                    timeout_secs: 3600,
+                    cpu_cores: 2.0,
+                    memory_mb: 4096,
+                    gpu_required: false,
+                };
+
+                info!("Starting challenge container: {}", ch.id);
+                match orch.add_challenge(config).await {
+                    Ok(_) => info!("Challenge container started: {}", ch.id),
+                    Err(e) => error!("Failed to start challenge {}: {}", ch.id, e),
+                }
+            }
+
+            // Start health monitoring
+            let orch_clone = orch.clone();
+            tokio::spawn(async move {
+                if let Err(e) = orch_clone.start().await {
+                    error!("Orchestrator health monitor error: {}", e);
+                }
+            });
+        }
+    }
 
     // RPC server
     let addr: SocketAddr = format!("{}:{}", args.rpc_addr, args.rpc_port).parse()?;
