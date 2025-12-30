@@ -1,54 +1,89 @@
-//! Bridge API - Proxy submissions to term-challenge
+//! Bridge API - Generic proxy to challenge containers
 //!
-//! This module provides bridge endpoints that proxy requests to the
-//! term-challenge container for the centralized submission flow.
+//! This module provides a generic bridge endpoint that proxies requests to
+//! any challenge container via `/api/v1/bridge/{challenge_name}/*`
+//!
+//! Example:
+//!   POST /api/v1/bridge/term-challenge/submit
+//!   GET  /api/v1/bridge/term-challenge/leaderboard
+//!   POST /api/v1/bridge/math-challenge/submit
 
 use crate::state::AppState;
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Path, State},
     http::{Request, StatusCode},
     response::{IntoResponse, Response},
+    Json,
 };
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
-/// Default challenge ID for term-challenge
-const TERM_CHALLENGE_ID: &str = "term-challenge";
+/// Get challenge endpoint URL by name
+/// Looks up in challenge manager or environment variable CHALLENGE_{NAME}_URL
+fn get_challenge_url(state: &AppState, challenge_name: &str) -> Option<String> {
+    // Normalize challenge name (replace - with _)
+    let env_name = challenge_name.to_uppercase().replace('-', "_");
 
-/// Get the term-challenge endpoint URL from environment or challenge manager
-fn get_term_challenge_url(state: &AppState) -> Option<String> {
-    // First check environment variable
-    if let Ok(url) = std::env::var("TERM_CHALLENGE_URL") {
+    // First check environment variable: CHALLENGE_{NAME}_URL
+    let env_key = format!("CHALLENGE_{}_URL", env_name);
+    if let Ok(url) = std::env::var(&env_key) {
+        debug!("Found {} = {}", env_key, url);
         return Some(url);
+    }
+
+    // Also check legacy TERM_CHALLENGE_URL for backward compatibility
+    if challenge_name == "term-challenge" || challenge_name == "term" {
+        if let Ok(url) = std::env::var("TERM_CHALLENGE_URL") {
+            return Some(url);
+        }
     }
 
     // Then check challenge manager
     if let Some(ref manager) = state.challenge_manager {
-        // Try multiple possible IDs
-        for id in &[
-            TERM_CHALLENGE_ID,
-            "term-challenge-server",
-            "42b0dd5c-894f-3281-136a-ce34a0971d9f",
-        ] {
-            if let Some(endpoint) = manager.get_endpoint(id) {
-                return Some(endpoint);
-            }
+        // Try exact name
+        if let Some(endpoint) = manager.get_endpoint(challenge_name) {
+            return Some(endpoint);
+        }
+
+        // Try with -server suffix
+        let with_server = format!("{}-server", challenge_name);
+        if let Some(endpoint) = manager.get_endpoint(&with_server) {
+            return Some(endpoint);
+        }
+
+        // Try challenge- prefix
+        let with_prefix = format!("challenge-{}", challenge_name);
+        if let Some(endpoint) = manager.get_endpoint(&with_prefix) {
+            return Some(endpoint);
         }
     }
 
     None
 }
 
-/// Proxy a request to term-challenge
-async fn proxy_to_term_challenge(state: &AppState, path: &str, request: Request<Body>) -> Response {
-    let base_url = match get_term_challenge_url(state) {
+/// Generic proxy to any challenge
+async fn proxy_to_challenge(
+    state: &AppState,
+    challenge_name: &str,
+    path: &str,
+    request: Request<Body>,
+) -> Response {
+    let base_url = match get_challenge_url(state, challenge_name) {
         Some(url) => url,
         None => {
-            warn!("Term-challenge not available - no endpoint configured");
+            warn!(
+                "Challenge '{}' not available - no endpoint configured",
+                challenge_name
+            );
             return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Term-challenge service not available. Configure TERM_CHALLENGE_URL or ensure challenge is running.",
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "Challenge not found",
+                    "challenge": challenge_name,
+                    "hint": format!("Set CHALLENGE_{}_URL or ensure challenge is running",
+                        challenge_name.to_uppercase().replace('-', "_"))
+                })),
             )
                 .into_response();
         }
@@ -59,7 +94,10 @@ async fn proxy_to_term_challenge(state: &AppState, path: &str, request: Request<
         base_url.trim_end_matches('/'),
         path.trim_start_matches('/')
     );
-    debug!("Proxying to term-challenge: {}", url);
+    debug!(
+        "Proxying to challenge '{}': {} -> {}",
+        challenge_name, path, url
+    );
 
     let method = request.method().clone();
     let headers = request.headers().clone();
@@ -73,7 +111,7 @@ async fn proxy_to_term_challenge(state: &AppState, path: &str, request: Request<
     };
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(120))
         .build()
         .unwrap();
 
@@ -111,71 +149,93 @@ async fn proxy_to_term_challenge(state: &AppState, path: &str, request: Request<
         }
         Err(e) => {
             if e.is_timeout() {
-                (StatusCode::GATEWAY_TIMEOUT, "Term-challenge timeout").into_response()
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(serde_json::json!({
+                        "error": "Challenge timeout",
+                        "challenge": challenge_name
+                    })),
+                )
+                    .into_response()
             } else if e.is_connect() {
-                warn!("Cannot connect to term-challenge at {}: {}", base_url, e);
+                warn!(
+                    "Cannot connect to challenge '{}' at {}: {}",
+                    challenge_name, base_url, e
+                );
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Term-challenge not reachable",
+                    Json(serde_json::json!({
+                        "error": "Challenge not reachable",
+                        "challenge": challenge_name,
+                        "url": base_url
+                    })),
                 )
                     .into_response()
             } else {
-                error!("Proxy error: {}", e);
-                (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", e)).into_response()
+                error!("Proxy error for '{}': {}", challenge_name, e);
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": format!("Proxy error: {}", e),
+                        "challenge": challenge_name
+                    })),
+                )
+                    .into_response()
             }
         }
     }
 }
 
-/// POST /api/v1/submit - Bridge to term-challenge submit endpoint
-pub async fn bridge_submit(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
-    info!("Bridging submit request to term-challenge");
-    proxy_to_term_challenge(&state, "/api/v1/submit", request).await
-}
-
-/// GET /api/v1/challenge/leaderboard - Bridge to term-challenge leaderboard
-pub async fn bridge_leaderboard(
+/// ANY /api/v1/bridge/{challenge_name}/*path - Generic bridge to any challenge
+///
+/// Routes:
+///   /api/v1/bridge/term-challenge/submit -> term-challenge /api/v1/submit
+///   /api/v1/bridge/term-challenge/leaderboard -> term-challenge /api/v1/leaderboard
+///   /api/v1/bridge/math-challenge/evaluate -> math-challenge /api/v1/evaluate
+pub async fn bridge_to_challenge(
     State(state): State<Arc<AppState>>,
+    Path((challenge_name, path)): Path<(String, String)>,
     request: Request<Body>,
 ) -> Response {
-    proxy_to_term_challenge(&state, "/api/v1/leaderboard", request).await
+    info!(
+        "Bridge request: challenge='{}' path='/{}'",
+        challenge_name, path
+    );
+
+    // Construct the API path (add /api/v1/ prefix if not present)
+    let api_path = if path.starts_with("api/") {
+        format!("/{}", path)
+    } else {
+        format!("/api/v1/{}", path)
+    };
+
+    proxy_to_challenge(&state, &challenge_name, &api_path, request).await
 }
 
-/// GET /api/v1/challenge/status - Bridge to term-challenge status
-pub async fn bridge_status(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
-    proxy_to_term_challenge(&state, "/api/v1/status", request).await
-}
+/// GET /api/v1/bridge - List available challenges
+pub async fn list_bridges(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let mut challenges = vec![];
 
-/// POST /api/v1/my/agents - Bridge to term-challenge my agents
-pub async fn bridge_my_agents(
-    State(state): State<Arc<AppState>>,
-    request: Request<Body>,
-) -> Response {
-    proxy_to_term_challenge(&state, "/api/v1/my/agents", request).await
-}
+    // Check known challenge environment variables
+    for name in &["TERM_CHALLENGE", "MATH_CHALLENGE", "CODE_CHALLENGE"] {
+        let env_key = format!("{}_URL", name);
+        if std::env::var(&env_key).is_ok() {
+            challenges.push(name.to_lowercase().replace('_', "-"));
+        }
+    }
 
-/// POST /api/v1/my/agents/:hash/source - Bridge to term-challenge source
-pub async fn bridge_my_agent_source(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(hash): axum::extract::Path<String>,
-    request: Request<Body>,
-) -> Response {
-    let path = format!("/api/v1/my/agents/{}/source", hash);
-    proxy_to_term_challenge(&state, &path, request).await
-}
+    // Add from challenge manager
+    if let Some(ref manager) = state.challenge_manager {
+        for id in manager.list_challenge_ids() {
+            if !challenges.contains(&id) {
+                challenges.push(id);
+            }
+        }
+    }
 
-/// POST /api/v1/validator/claim_job - Bridge to term-challenge validator claim
-pub async fn bridge_validator_claim(
-    State(state): State<Arc<AppState>>,
-    request: Request<Body>,
-) -> Response {
-    proxy_to_term_challenge(&state, "/api/v1/validator/claim_job", request).await
-}
-
-/// POST /api/v1/validator/complete_job - Bridge to term-challenge validator complete
-pub async fn bridge_validator_complete(
-    State(state): State<Arc<AppState>>,
-    request: Request<Body>,
-) -> Response {
-    proxy_to_term_challenge(&state, "/api/v1/validator/complete_job", request).await
+    Json(serde_json::json!({
+        "bridges": challenges,
+        "usage": "/api/v1/bridge/{challenge_name}/{path}",
+        "example": "/api/v1/bridge/term-challenge/submit"
+    }))
 }
