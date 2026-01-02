@@ -1,13 +1,24 @@
 //! Challenge Events API
 //!
 //! Allows challenges to broadcast custom events to validators via WebSocket.
+//! Secured with shared secret to prevent unauthorized broadcasts.
 
 use crate::models::{ChallengeCustomEvent, WsEvent};
 use crate::state::AppState;
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
+
+/// Shared secret for challenge event broadcasts (set via BROADCAST_SECRET env var)
+/// Challenges must include this in X-Broadcast-Secret header
+fn get_broadcast_secret() -> Option<String> {
+    std::env::var("BROADCAST_SECRET").ok()
+}
 
 #[derive(Debug, Deserialize)]
 pub struct BroadcastEventRequest {
@@ -30,10 +41,28 @@ pub struct BroadcastEventResponse {
 ///
 /// Called by challenge containers to notify validators of events.
 /// Validators filter events by challenge_id to receive only relevant ones.
+///
+/// Requires X-Broadcast-Secret header matching BROADCAST_SECRET env var.
 pub async fn broadcast_event(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<BroadcastEventRequest>,
 ) -> Result<Json<BroadcastEventResponse>, (StatusCode, String)> {
+    // Verify broadcast secret
+    if let Some(expected_secret) = get_broadcast_secret() {
+        let provided_secret = headers
+            .get("X-Broadcast-Secret")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if provided_secret != expected_secret {
+            warn!(
+                "Unauthorized broadcast attempt for challenge: {}",
+                req.challenge_id
+            );
+            return Err((StatusCode::UNAUTHORIZED, "Invalid broadcast secret".into()));
+        }
+    }
     // Create the custom event
     let event = ChallengeCustomEvent {
         challenge_id: req.challenge_id.clone(),

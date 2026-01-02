@@ -189,6 +189,11 @@ pub async fn run(args: ServerArgs) -> Result<()> {
             "/api/v1/bridge/:challenge/*path",
             any(api::bridge::bridge_to_challenge),
         )
+        // Events API - Broadcast to validators (requires BROADCAST_SECRET)
+        .route(
+            "/api/v1/events/broadcast",
+            post(api::events::broadcast_event),
+        )
         // Submissions API
         .route(
             "/api/v1/submissions",
