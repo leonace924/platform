@@ -515,7 +515,8 @@ impl DockerClient {
         // Build environment variables
         // Note: Setting env overrides image ENV, so we include common vars
         let mut env: Vec<String> = Vec::new();
-        env.push(format!("CHALLENGE_ID={}", config.challenge_id));
+        // Use challenge NAME (not UUID) so validators can match events by name
+        env.push(format!("CHALLENGE_ID={}", config.name));
         env.push(format!("MECHANISM_ID={}", config.mechanism_id));
         // Pass through important environment variables from image defaults
         env.push("TASKS_DIR=/app/data/tasks".to_string());
