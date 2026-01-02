@@ -31,9 +31,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use crate::challenge::Challenge;
-use crate::context::ChallengeContext;
 use crate::error::ChallengeError;
+
+#[cfg(feature = "http-server")]
+use axum::extract::State;
 
 /// Server configuration
 #[derive(Debug, Clone)]

@@ -153,6 +153,10 @@ async fn main() -> anyhow::Result<()> {
             post(api::validators::heartbeat),
         )
         .route(
+            "/api/v1/validators/whitelist",
+            get(api::validators::get_whitelisted_validators),
+        )
+        .route(
             "/api/v1/network/state",
             get(api::challenges::get_network_state),
         )

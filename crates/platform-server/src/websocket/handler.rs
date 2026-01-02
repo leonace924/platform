@@ -1,5 +1,7 @@
 //! WebSocket connection handler
 
+use crate::api::auth::verify_signature;
+use crate::db::queries;
 use crate::models::WsEvent;
 use crate::state::AppState;
 use crate::websocket::events::WsConnection;
@@ -8,7 +10,8 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    response::Response,
+    http::StatusCode,
+    response::{IntoResponse, Response},
 };
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -19,8 +22,13 @@ use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
 pub struct WsQuery {
-    pub token: Option<String>,
+    /// Validator hotkey (SS58 format)
     pub hotkey: Option<String>,
+    /// Timestamp for signature verification
+    pub timestamp: Option<i64>,
+    /// Signature of "ws_connect:{hotkey}:{timestamp}"
+    pub signature: Option<String>,
+    /// Role (validator, miner, etc.)
     pub role: Option<String>,
 }
 
@@ -29,6 +37,60 @@ pub async fn ws_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<WsQuery>,
 ) -> Response {
+    // Verify authentication if hotkey is provided
+    if let Some(ref hotkey) = query.hotkey {
+        let timestamp = match query.timestamp {
+            Some(ts) => ts,
+            None => {
+                warn!(
+                    "WebSocket connection rejected: missing timestamp for hotkey {}",
+                    hotkey
+                );
+                return (StatusCode::UNAUTHORIZED, "Missing timestamp").into_response();
+            }
+        };
+
+        let signature = match &query.signature {
+            Some(sig) => sig,
+            None => {
+                warn!(
+                    "WebSocket connection rejected: missing signature for hotkey {}",
+                    hotkey
+                );
+                return (StatusCode::UNAUTHORIZED, "Missing signature").into_response();
+            }
+        };
+
+        // Verify timestamp is recent (within 5 minutes)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        if (now - timestamp).abs() > 300 {
+            warn!(
+                "WebSocket connection rejected: timestamp too old for hotkey {}",
+                hotkey
+            );
+            return (StatusCode::UNAUTHORIZED, "Timestamp too old").into_response();
+        }
+
+        // Verify signature
+        let message = format!("ws_connect:{}:{}", hotkey, timestamp);
+        if !verify_signature(hotkey, &message, signature) {
+            warn!(
+                "WebSocket connection rejected: invalid signature for hotkey {}",
+                hotkey
+            );
+            return (StatusCode::UNAUTHORIZED, "Invalid signature").into_response();
+        }
+
+        info!(
+            "WebSocket authenticated for hotkey: {}",
+            &hotkey[..16.min(hotkey.len())]
+        );
+    }
+
     let conn_id = Uuid::new_v4();
     ws.on_upgrade(move |socket| handle_socket(socket, state, conn_id, query))
 }
@@ -47,6 +109,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, conn_id: Uuid, q
         "WebSocket connected: {} (hotkey: {:?}, role: {:?})",
         conn_id, query.hotkey, query.role
     );
+
+    // Register validator in DB when they connect with a hotkey (updates last_seen)
+    if let Some(ref hotkey) = query.hotkey {
+        if let Err(e) = queries::upsert_validator(&state.db, hotkey, 0).await {
+            warn!("Failed to register validator {}: {}", hotkey, e);
+        } else {
+            info!("Validator {} registered/updated last_seen", hotkey);
+        }
+    }
 
     let mut event_rx = state.broadcaster.subscribe();
 

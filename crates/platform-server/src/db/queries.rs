@@ -89,6 +89,23 @@ pub async fn get_total_stake(pool: &Pool) -> Result<u64> {
     Ok(stake as u64)
 }
 
+/// Get whitelisted validators (stake >= min_stake and last_seen within 24h)
+pub async fn get_whitelisted_validators(pool: &Pool, min_stake: i64) -> Result<Vec<String>> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "SELECT hotkey FROM validators 
+             WHERE is_active = TRUE 
+             AND stake >= $1 
+             AND last_seen >= NOW() - INTERVAL '24 hours'
+             ORDER BY stake DESC",
+            &[&min_stake],
+        )
+        .await?;
+
+    Ok(rows.iter().map(|row| row.get(0)).collect())
+}
+
 // ============================================================================
 // SUBMISSIONS
 // ============================================================================

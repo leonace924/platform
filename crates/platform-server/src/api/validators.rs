@@ -71,3 +71,17 @@ pub async fn heartbeat(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
+
+/// Minimum stake required for whitelist (10,000 TAO in RAO)
+const MIN_STAKE_FOR_WHITELIST: i64 = 10_000_000_000_000;
+
+/// GET /api/v1/validators/whitelist - Get whitelisted validators
+/// Returns validators with stake >= 10,000 TAO who connected in the last 24h
+pub async fn get_whitelisted_validators(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    let validators = queries::get_whitelisted_validators(&state.db, MIN_STAKE_FOR_WHITELIST)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(validators))
+}
