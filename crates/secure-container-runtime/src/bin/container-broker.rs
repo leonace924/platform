@@ -32,12 +32,16 @@ const DEFAULT_HTTP_PORT: u16 = 8091;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize logging
+    // Initialize logging - use RUST_LOG env var or default to debug for broker
+    let log_level = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(Level::DEBUG);
+
     FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .with_target(false)
+        .with_max_level(log_level)
+        .with_target(true) // Show module path for debugging
         .with_thread_ids(false)
-        .compact()
         .init();
 
     info!("Container Broker starting...");

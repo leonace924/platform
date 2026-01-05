@@ -91,7 +91,17 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
+                // Platform server itself
                 .add_directive("platform_server=debug".parse().unwrap())
+                // Challenge orchestration and runtime
+                .add_directive("challenge_orchestrator=debug".parse().unwrap())
+                .add_directive("challenge_runtime=debug".parse().unwrap())
+                .add_directive("platform_challenge_sdk=debug".parse().unwrap())
+                // Container broker
+                .add_directive("secure_container_runtime=debug".parse().unwrap())
+                // Term challenge (when proxied)
+                .add_directive("term_challenge=debug".parse().unwrap())
+                // Default level
                 .add_directive("info".parse().unwrap()),
         )
         .init();

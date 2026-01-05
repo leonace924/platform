@@ -114,6 +114,24 @@ impl Request {
         }
     }
 
+    /// Get request type as string for logging
+    pub fn request_type(&self) -> &'static str {
+        match self {
+            Request::Create { .. } => "create",
+            Request::Start { .. } => "start",
+            Request::Stop { .. } => "stop",
+            Request::Remove { .. } => "remove",
+            Request::Exec { .. } => "exec",
+            Request::Inspect { .. } => "inspect",
+            Request::List { .. } => "list",
+            Request::Logs { .. } => "logs",
+            Request::Pull { .. } => "pull",
+            Request::Ping { .. } => "ping",
+            Request::CopyFrom { .. } => "copy_from",
+            Request::CopyTo { .. } => "copy_to",
+        }
+    }
+
     /// Get challenge_id if applicable
     pub fn challenge_id(&self) -> Option<&str> {
         match self {

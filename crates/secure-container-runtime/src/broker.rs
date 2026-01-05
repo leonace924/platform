@@ -147,7 +147,14 @@ impl ContainerBroker {
 
     /// Handle a single request
     pub async fn handle_request(&self, request: Request) -> Response {
-        let _request_id = request.request_id().to_string();
+        let request_id = request.request_id().to_string();
+
+        // Log all incoming requests for debugging
+        debug!(
+            request_id = %request_id,
+            request_type = %request.request_type(),
+            "Handling broker request"
+        );
 
         match request {
             Request::Ping { request_id } => Response::Pong {
