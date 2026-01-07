@@ -30,6 +30,11 @@ use tracing::{error, info, warn};
 
 /// Default broker socket path
 pub const DEFAULT_BROKER_SOCKET: &str = "/var/run/platform/broker.sock";
+const BROKER_SOCKET_OVERRIDE_ENV: &str = "BROKER_SOCKET_OVERRIDE";
+
+fn default_broker_socket_path() -> String {
+    std::env::var(BROKER_SOCKET_OVERRIDE_ENV).unwrap_or_else(|_| DEFAULT_BROKER_SOCKET.to_string())
+}
 
 /// Container backend trait for managing challenge containers
 #[async_trait]
@@ -91,10 +96,11 @@ impl SecureBackend {
             warn!(socket = %socket, "Broker socket from env does not exist");
         }
 
-        // Priority 2: Default socket path
-        if Path::new(DEFAULT_BROKER_SOCKET).exists() {
-            info!(socket = %DEFAULT_BROKER_SOCKET, "Using default broker socket");
-            return Some(Self::new(DEFAULT_BROKER_SOCKET, &validator_id));
+        // Priority 2: Default socket path (allow override for tests)
+        let default_socket = default_broker_socket_path();
+        if Path::new(&default_socket).exists() {
+            info!(socket = %default_socket, "Using default broker socket");
+            return Some(Self::new(&default_socket, &validator_id));
         }
 
         None
@@ -107,7 +113,8 @@ impl SecureBackend {
                 return true;
             }
         }
-        Path::new(DEFAULT_BROKER_SOCKET).exists()
+        let default_socket = default_broker_socket_path();
+        Path::new(&default_socket).exists()
     }
 }
 
@@ -302,24 +309,28 @@ impl ContainerBackend for DirectDockerBackend {
 /// 2. Broker socket available -> Secure broker (production default)
 /// 3. No broker + not dev mode -> Error (production requires broker)
 pub async fn create_backend() -> anyhow::Result<Box<dyn ContainerBackend>> {
-    // Check if explicitly in development mode
-    let dev_mode = std::env::var("DEVELOPMENT_MODE")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
-
-    if dev_mode {
-        info!("DEVELOPMENT_MODE=true: Using direct Docker (local development)");
-        let direct = DirectDockerBackend::new().await?;
-        return Ok(Box::new(direct));
+    match select_backend_mode() {
+        BackendMode::Development => {
+            info!("DEVELOPMENT_MODE=true: Using direct Docker (local development)");
+            let direct = DirectDockerBackend::new().await?;
+            Ok(Box::new(direct))
+        }
+        BackendMode::Secure => {
+            if let Some(secure) = SecureBackend::from_env() {
+                info!("Using secure container broker (production mode)");
+                Ok(Box::new(secure))
+            } else {
+                warn!(
+                    "Secure backend reported as available but failed to initialize; falling back to Docker"
+                );
+                create_docker_fallback_backend().await
+            }
+        }
+        BackendMode::Fallback => create_docker_fallback_backend().await,
     }
+}
 
-    // Try to use secure broker (default for production)
-    if let Some(secure) = SecureBackend::from_env() {
-        info!("Using secure container broker (production mode)");
-        return Ok(Box::new(secure));
-    }
-
-    // No broker available - try Docker as last resort but warn
+async fn create_docker_fallback_backend() -> anyhow::Result<Box<dyn ContainerBackend>> {
     warn!("Broker not available. Attempting Docker fallback...");
     warn!("This should only happen in local development!");
     warn!("Set DEVELOPMENT_MODE=true to suppress this warning, or start the broker.");
@@ -333,12 +344,30 @@ pub async fn create_backend() -> anyhow::Result<Box<dyn ContainerBackend>> {
             error!("Cannot connect to Docker: {}", e);
             error!("For production: Start the container-broker service");
             error!("For development: Set DEVELOPMENT_MODE=true and ensure Docker is running");
+            let default_socket = default_broker_socket_path();
             Err(anyhow::anyhow!(
                 "No container backend available. \
                  Start broker at {} or set DEVELOPMENT_MODE=true for local Docker",
-                DEFAULT_BROKER_SOCKET
+                default_socket
             ))
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendMode {
+    Development,
+    Secure,
+    Fallback,
+}
+
+pub fn select_backend_mode() -> BackendMode {
+    if is_development_mode() {
+        BackendMode::Development
+    } else if SecureBackend::is_available() {
+        BackendMode::Secure
+    } else {
+        BackendMode::Fallback
     }
 }
 
@@ -358,13 +387,14 @@ pub fn is_development_mode() -> bool {
 mod tests {
     use super::*;
     use serial_test::serial;
-    use tempfile::NamedTempFile;
+    use tempfile::{tempdir, NamedTempFile};
 
     fn reset_env() {
         for key in [
             "DEVELOPMENT_MODE",
             "CONTAINER_BROKER_SOCKET",
             "VALIDATOR_HOTKEY",
+            BROKER_SOCKET_OVERRIDE_ENV,
         ] {
             std::env::remove_var(key);
         }
@@ -412,5 +442,57 @@ mod tests {
 
         reset_env();
         drop(temp_socket);
+    }
+
+    #[test]
+    #[serial]
+    fn test_secure_backend_is_available_with_override_socket() {
+        reset_env();
+        let temp_socket = NamedTempFile::new().expect("temp socket path");
+        let socket_path = temp_socket.path().to_path_buf();
+        std::env::set_var(BROKER_SOCKET_OVERRIDE_ENV, &socket_path);
+
+        assert!(SecureBackend::is_available());
+
+        reset_env();
+        drop(temp_socket);
+    }
+
+    #[test]
+    #[serial]
+    fn test_select_backend_mode_prefers_development_mode() {
+        reset_env();
+        std::env::set_var("DEVELOPMENT_MODE", "true");
+
+        assert_eq!(select_backend_mode(), BackendMode::Development);
+
+        reset_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_select_backend_mode_prefers_secure_when_broker_available() {
+        reset_env();
+        let temp_socket = NamedTempFile::new().expect("temp socket path");
+        let socket_path = temp_socket.path().to_path_buf();
+        std::env::set_var(BROKER_SOCKET_OVERRIDE_ENV, &socket_path);
+
+        assert_eq!(select_backend_mode(), BackendMode::Secure);
+
+        reset_env();
+        drop(temp_socket);
+    }
+
+    #[test]
+    #[serial]
+    fn test_select_backend_mode_falls_back_without_broker() {
+        reset_env();
+        let dir = tempdir().expect("temp dir");
+        let missing_socket = dir.path().join("missing.sock");
+        std::env::set_var(BROKER_SOCKET_OVERRIDE_ENV, &missing_socket);
+
+        assert_eq!(select_backend_mode(), BackendMode::Fallback);
+
+        reset_env();
     }
 }
