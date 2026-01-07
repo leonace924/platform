@@ -941,6 +941,72 @@ impl DockerClient {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    fn reset_env(keys: &[&str]) {
+        for key in keys {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_is_image_allowed_enforces_whitelist() {
+        reset_env(&["DEVELOPMENT_MODE"]);
+        assert!(DockerClient::is_image_allowed(
+            "ghcr.io/platformnetwork/challenge:latest"
+        ));
+        assert!(!DockerClient::is_image_allowed(
+            "docker.io/library/alpine:latest"
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn test_is_image_allowed_allows_dev_mode_override() {
+        std::env::set_var("DEVELOPMENT_MODE", "true");
+        assert!(DockerClient::is_image_allowed(
+            "docker.io/library/alpine:latest"
+        ));
+        reset_env(&["DEVELOPMENT_MODE"]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_validator_suffix_prefers_validator_name() {
+        reset_env(&["VALIDATOR_NAME", "HOSTNAME"]);
+        std::env::set_var("VALIDATOR_NAME", "Node 42-Test");
+        std::env::set_var("HOSTNAME", "should_not_be_used");
+
+        let suffix = DockerClient::get_validator_suffix();
+        assert_eq!(suffix, "node42test");
+
+        reset_env(&["VALIDATOR_NAME", "HOSTNAME"]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_validator_suffix_uses_container_id_from_hostname() {
+        reset_env(&["VALIDATOR_NAME"]);
+        std::env::set_var("HOSTNAME", "abcdef123456");
+
+        let suffix = DockerClient::get_validator_suffix();
+        assert_eq!(suffix, "abcdef123456");
+
+        reset_env(&["HOSTNAME"]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker"]
+    async fn test_docker_connect() {
+        let client = DockerClient::connect().await;
+        assert!(client.is_ok());
+    }
+}
+
 /// Result of container cleanup operation
 #[derive(Debug, Default)]
 pub struct CleanupResult {
@@ -952,17 +1018,5 @@ pub struct CleanupResult {
 impl CleanupResult {
     pub fn success(&self) -> bool {
         self.errors.is_empty()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    #[ignore = "requires Docker"]
-    async fn test_docker_connect() {
-        let client = DockerClient::connect().await;
-        assert!(client.is_ok());
     }
 }

@@ -270,6 +270,22 @@ pub enum EvaluatorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::RwLock;
+    use platform_core::ChallengeId;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio_test::block_on;
+
+    fn sample_instance(status: ContainerStatus) -> ChallengeInstance {
+        ChallengeInstance {
+            challenge_id: ChallengeId::new(),
+            container_id: "cid".into(),
+            image: "ghcr.io/platformnetwork/example:latest".into(),
+            endpoint: "http://127.0.0.1:9000".into(),
+            started_at: chrono::Utc::now(),
+            status,
+        }
+    }
 
     #[test]
     fn test_challenge_info_deserialize() {
@@ -282,5 +298,64 @@ mod tests {
         let info: ChallengeInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.name, "term-challenge");
         assert_eq!(info.mechanism_id, 0); // default
+    }
+
+    #[test]
+    fn test_evaluate_generic_requires_running_status() {
+        let challenges = Arc::new(RwLock::new(HashMap::new()));
+        let instance = sample_instance(ContainerStatus::Starting);
+        let challenge_id = instance.challenge_id;
+        challenges.write().insert(challenge_id, instance.clone());
+
+        let evaluator = ChallengeEvaluator::new(challenges);
+        let err = block_on(evaluator.evaluate_generic(challenge_id, serde_json::json!({}), None))
+            .expect_err("should fail when not running");
+
+        match err {
+            EvaluatorError::ChallengeNotReady(id) => assert_eq!(id, challenge_id),
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_proxy_request_missing_challenge() {
+        let evaluator = ChallengeEvaluator::new(Arc::new(RwLock::new(HashMap::new())));
+        let challenge_id = ChallengeId::new();
+        let err = block_on(evaluator.proxy_request(
+            challenge_id,
+            "status",
+            reqwest::Method::GET,
+            None,
+            None,
+        ))
+        .expect_err("missing challenge should error");
+
+        match err {
+            EvaluatorError::ChallengeNotFound(id) => assert_eq!(id, challenge_id),
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_list_challenges_returns_current_instances() {
+        let challenges = Arc::new(RwLock::new(HashMap::new()));
+        let instance_a = sample_instance(ContainerStatus::Running);
+        let instance_b = sample_instance(ContainerStatus::Unhealthy);
+        let id_a = instance_a.challenge_id;
+        let id_b = instance_b.challenge_id;
+        challenges.write().insert(id_a, instance_a.clone());
+        challenges.write().insert(id_b, instance_b.clone());
+
+        let evaluator = ChallengeEvaluator::new(challenges);
+        let list = evaluator.list_challenges();
+        assert_eq!(list.len(), 2);
+
+        let status_map: std::collections::HashMap<ChallengeId, ContainerStatus> = list
+            .into_iter()
+            .map(|entry| (entry.challenge_id, entry.status))
+            .collect();
+
+        assert_eq!(status_map.get(&id_a), Some(&ContainerStatus::Running));
+        assert_eq!(status_map.get(&id_b), Some(&ContainerStatus::Unhealthy));
     }
 }

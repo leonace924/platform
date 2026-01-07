@@ -200,6 +200,22 @@ impl HealthSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::RwLock;
+    use platform_core::ChallengeId;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn sample_instance(status: ContainerStatus) -> ChallengeInstance {
+        ChallengeInstance {
+            challenge_id: ChallengeId::new(),
+            container_id: "cid".into(),
+            image: "ghcr.io/platformnetwork/example:latest".into(),
+            endpoint: "http://127.0.0.1:9000".into(),
+            started_at: chrono::Utc::now(),
+            status,
+        }
+    }
 
     #[test]
     fn test_health_summary() {
@@ -227,5 +243,39 @@ mod tests {
 
         assert!(summary.all_healthy());
         assert_eq!(summary.percentage_healthy(), 100.0);
+    }
+
+    #[test]
+    fn test_percentage_healthy_handles_zero_total() {
+        let summary = HealthSummary {
+            total: 0,
+            running: 0,
+            unhealthy: 0,
+            starting: 0,
+            stopped: 0,
+        };
+
+        assert_eq!(summary.percentage_healthy(), 100.0);
+    }
+
+    #[test]
+    fn test_get_unhealthy_lists_ids() {
+        let challenges = Arc::new(RwLock::new(HashMap::new()));
+        let healthy_instance = sample_instance(ContainerStatus::Running);
+        let healthy_id = healthy_instance.challenge_id;
+        let unhealthy_instance = sample_instance(ContainerStatus::Unhealthy);
+        let unhealthy_id = unhealthy_instance.challenge_id;
+
+        {
+            let mut guard = challenges.write();
+            guard.insert(healthy_id, healthy_instance.clone());
+            guard.insert(unhealthy_id, unhealthy_instance.clone());
+        }
+
+        let monitor = HealthMonitor::new(challenges, Duration::from_secs(5));
+        let ids = monitor.get_unhealthy();
+
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], unhealthy_id);
     }
 }

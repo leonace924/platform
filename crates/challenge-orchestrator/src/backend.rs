@@ -353,3 +353,64 @@ pub fn is_development_mode() -> bool {
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use tempfile::NamedTempFile;
+
+    fn reset_env() {
+        for key in [
+            "DEVELOPMENT_MODE",
+            "CONTAINER_BROKER_SOCKET",
+            "VALIDATOR_HOTKEY",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_is_development_mode_reflects_env() {
+        reset_env();
+        assert!(!is_development_mode());
+
+        std::env::set_var("DEVELOPMENT_MODE", "1");
+        assert!(is_development_mode());
+
+        std::env::set_var("DEVELOPMENT_MODE", "false");
+        assert!(!is_development_mode());
+        reset_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_secure_backend_from_env_detects_socket() {
+        reset_env();
+        let temp_socket = NamedTempFile::new().expect("temp socket path");
+        let socket_path = temp_socket.path().to_path_buf();
+        std::env::set_var("CONTAINER_BROKER_SOCKET", &socket_path);
+        std::env::set_var("VALIDATOR_HOTKEY", "validator123");
+
+        let backend = SecureBackend::from_env().expect("should create backend from env");
+        assert_eq!(backend.validator_id, "validator123");
+
+        reset_env();
+        drop(temp_socket);
+    }
+
+    #[test]
+    #[serial]
+    fn test_is_secure_mode_uses_env_socket() {
+        reset_env();
+        let temp_socket = NamedTempFile::new().expect("temp socket path");
+        let socket_path = temp_socket.path().to_path_buf();
+        std::env::set_var("CONTAINER_BROKER_SOCKET", &socket_path);
+
+        assert!(is_secure_mode());
+
+        reset_env();
+        drop(temp_socket);
+    }
+}
