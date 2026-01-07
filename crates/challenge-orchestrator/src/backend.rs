@@ -1,8 +1,9 @@
 //! Container backend abstraction
 //!
-//! Provides a unified interface for container management that can use:
-//! - SecureContainerClient via broker (DEFAULT for production validators)
-//! - Direct Docker (ONLY for local development when DEVELOPMENT_MODE=true)
+//! This module selects the concrete runtime bridge that the orchestrator uses
+//! to manipulate containers. In production it proxies through the
+//! `secure-container-runtime` broker while still allowing direct Docker access
+//! when a developer explicitly opts into `DEVELOPMENT_MODE=true`.
 //!
 //! ## Backend Selection (Priority Order)
 //!
@@ -13,12 +14,11 @@
 //!
 //! ## Security
 //!
-//! In production, challenges MUST run through the secure broker.
-//! The broker enforces:
-//! - Image whitelisting (only ghcr.io/platformnetwork/)
-//! - Non-privileged containers
-//! - Resource limits
-//! - No Docker socket access for challenges
+//! The secure backend enforces:
+//! - Image allow-listing (`ghcr.io/platformnetwork/`)
+//! - Non-privileged containers with resource limits baked in
+//! - Network isolation handled by the broker
+//! - No direct Docker socket exposure for workloads
 
 use crate::{ChallengeContainerConfig, ChallengeDocker, ChallengeInstance, ContainerStatus};
 use async_trait::async_trait;

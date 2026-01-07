@@ -1,9 +1,11 @@
 //! Challenge evaluator - generic proxy for routing requests to challenge containers
 //!
-//! IMPORTANT: This evaluator is challenge-agnostic. Each challenge defines its own
-//! request/response format. The evaluator simply proxies JSON payloads.
+//! The evaluator keeps HTTP plumbing separate from challenge logic. It simply
+//! forwards JSON payloads to the configured container endpoint, enforces
+//! timeouts, and surfaces useful errors back to the validator.
 //!
-//! For term-challenge specific formats, see term-challenge-repo/src/server.rs
+//! For challenge-specific schemas, see each challenge repository (for example,
+//! `term-challenge-repo/src/server.rs`).
 
 use crate::{ChallengeInstance, ContainerStatus};
 use parking_lot::RwLock;
@@ -14,7 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-/// Generic evaluator for routing requests to challenge containers
+/// Generic evaluator for routing requests to challenge containers with baked-in
+/// HTTP client configuration (timeouts, retries handled upstream).
 pub struct ChallengeEvaluator {
     challenges: Arc<RwLock<HashMap<ChallengeId, ChallengeInstance>>>,
     client: reqwest::Client,

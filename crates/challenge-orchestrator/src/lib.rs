@@ -1,15 +1,22 @@
 //! Challenge Orchestrator
 //!
-//! Manages Docker containers for challenges. Provides:
-//! - Container lifecycle (start, stop, update)
-//! - Health monitoring
-//! - Evaluation routing
-//! - Hot-swap without core restart
+//! Provides a high-level API for managing the full lifecycle of challenge
+//! containers. The crate wires together networking bootstrap, backend
+//! selection, container health monitoring, and the HTTP evaluator used by the
+//! validator node.
 //!
-//! ## Backend Selection (Secure by Default)
+//! ### Responsibilities
+//! - Detect the correct container backend (secure broker vs. direct Docker)
+//! - Keep challenge containers on the `platform-network` with automatic
+//!   self-attachment for the validator container
+//! - Track every running challenge and expose health + evaluation helpers
+//! - Refresh or hot-swap containers without bouncing the validator
 //!
-//! The orchestrator uses the **secure broker by default** in production.
-//! Direct Docker is ONLY used when explicitly in development mode.
+//! ### Backend Selection (Secure by Default)
+//!
+//! The orchestrator always prefers the secure broker. Direct Docker is only
+//! selected when `DEVELOPMENT_MODE=true`, which explicitly opts into relaxed
+//! security for local workflows.
 //!
 //! Priority order:
 //! 1. `DEVELOPMENT_MODE=true` -> Direct Docker (local dev only)
@@ -39,7 +46,8 @@ use platform_core::ChallengeId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Main orchestrator managing all challenge containers
+/// High-level façade that keeps container state, evaluator access, and health
+/// monitoring in sync for every registered challenge.
 #[allow(dead_code)]
 pub struct ChallengeOrchestrator {
     docker: Arc<dyn ChallengeDocker>,
@@ -52,6 +60,8 @@ pub struct ChallengeOrchestrator {
 pub const PLATFORM_NETWORK: &str = "platform-network";
 
 impl ChallengeOrchestrator {
+    /// Create a new orchestrator by auto-detecting the Docker runtime inside
+    /// the validator container and ensuring networking prerequisites exist.
     pub async fn new(config: OrchestratorConfig) -> anyhow::Result<Self> {
         #[cfg(test)]
         if let Some(docker) = Self::take_test_docker_client() {
@@ -65,6 +75,8 @@ impl ChallengeOrchestrator {
         Self::bootstrap_with_docker(docker, config).await
     }
 
+    /// Reusable constructor path shared between production and tests once a
+    /// concrete Docker client is available.
     async fn bootstrap_with_docker(
         docker: DockerClient,
         config: OrchestratorConfig,

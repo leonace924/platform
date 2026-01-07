@@ -1,4 +1,9 @@
 //! Container lifecycle management
+//!
+//! Handles add/update/remove flows for challenge containers while keeping the
+//! in-memory config/state stores consistent. The lifecycle manager is used by
+//! the orchestrator as the primitive for rolling refreshes, unhealthy restarts,
+//! and declarative sync operations.
 
 #[cfg(test)]
 use crate::CleanupResult;
@@ -9,7 +14,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info};
 
-/// Manages the lifecycle of challenge containers
+/// Manages the lifecycle of challenge containers, retaining both the live
+/// container handles and the configs needed to recreate them during restarts.
 pub struct LifecycleManager {
     docker: Box<dyn ChallengeDocker>,
     challenges: Arc<RwLock<HashMap<ChallengeId, ChallengeInstance>>>,

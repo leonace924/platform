@@ -1,4 +1,8 @@
 //! Configuration types for challenge orchestrator
+//!
+//! Exposes `OrchestratorConfig`, which is serializable/deserializable with
+//! human-friendly duration fields (plain seconds) so it can be shared between
+//! the validator process and external tooling.
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -14,10 +18,10 @@ pub struct OrchestratorConfig {
     /// Health check interval
     #[serde(with = "humantime_serde")]
     pub health_check_interval: Duration,
-    /// Container stop timeout
+    /// Grace period to give Docker before force-stopping a container
     #[serde(with = "humantime_serde")]
     pub stop_timeout: Duration,
-    /// Docker registry (optional, for private registries)
+    /// Optional registry credentials for private images
     pub registry: Option<RegistryConfig>,
 }
 
@@ -32,7 +36,7 @@ impl Default for OrchestratorConfig {
     }
 }
 
-/// Docker registry configuration
+/// Optional Docker registry credentials for pulling private challenge images.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RegistryConfig {
     pub url: String,

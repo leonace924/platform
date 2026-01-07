@@ -1,7 +1,14 @@
 //! Docker client wrapper for container management
 //!
-//! SECURITY: Only images from whitelisted registries (ghcr.io/platformnetwork/)
-//! are allowed to be pulled or run. This prevents malicious container attacks.
+//! Provides the low-level primitives required when the orchestrator is
+//! connected directly to Docker (typically during development or when the
+//! secure broker is unavailable). Network bootstrap, log streaming, and image
+//! pulls are all funneled through a thin trait (`DockerBridge`) that makes it
+//! easy to stub the Docker daemon in tests.
+//!
+//! SECURITY: Only images from allow-listed registries
+//! (`ghcr.io/platformnetwork/`) are allowed to be pulled or run. This prevents
+//! malicious container attacks when bypassing the broker.
 
 use crate::{ChallengeContainerConfig, ChallengeInstance, ContainerStatus};
 use async_trait::async_trait;
@@ -179,6 +186,10 @@ impl DockerBridge for BollardBridge {
 }
 
 /// Docker client for managing challenge containers
+///
+/// The client ensures challenge containers are attached to the configured
+/// network, reuses volumes when possible, and funnels blocking Docker API
+/// calls through an async-friendly bridge.
 pub struct DockerClient {
     docker: Arc<dyn DockerBridge>,
     network_name: String,
