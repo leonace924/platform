@@ -955,4 +955,181 @@ mod tests {
         assert_eq!(sync.governance().block_height(), 1_000_000);
         assert_eq!(sync.governance().total_stake().0, 300_000_000_000);
     }
+
+    #[tokio::test]
+    async fn test_governance_pbft_new() {
+        let keypair = Keypair::generate();
+        let state = Arc::new(RwLock::new(ChainState::new(
+            keypair.hotkey(),
+            platform_core::NetworkConfig::default(),
+        )));
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let pbft = Arc::new(PBFTEngine::new(keypair.clone(), state.clone(), tx));
+
+        let gov_pbft = GovernancePBFT::new(pbft, state, keypair);
+
+        // Verify initialization - governance status
+        let status = gov_pbft.governance_status();
+        assert!(status.is_bootstrap_period);
+    }
+
+    #[tokio::test]
+    async fn test_set_block_height() {
+        let keypair = Keypair::generate();
+        let state = Arc::new(RwLock::new(ChainState::new(
+            keypair.hotkey(),
+            platform_core::NetworkConfig::default(),
+        )));
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let pbft = Arc::new(PBFTEngine::new(keypair.clone(), state.clone(), tx));
+
+        let gov_pbft = GovernancePBFT::new(pbft, state, keypair);
+
+        gov_pbft.set_block_height(5000);
+        assert_eq!(gov_pbft.governance.stake_governance().block_height(), 5000);
+    }
+
+    #[tokio::test]
+    async fn test_update_stakes_from_metagraph() {
+        let keypair = Keypair::generate();
+        let state = Arc::new(RwLock::new(ChainState::new(
+            keypair.hotkey(),
+            platform_core::NetworkConfig::default(),
+        )));
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let pbft = Arc::new(PBFTEngine::new(keypair.clone(), state.clone(), tx));
+
+        let gov_pbft = GovernancePBFT::new(pbft, state, keypair);
+
+        let validators = vec![
+            ValidatorInfo::new(Hotkey([1u8; 32]), Stake(100_000_000_000)),
+            ValidatorInfo::new(Hotkey([2u8; 32]), Stake(200_000_000_000)),
+        ];
+
+        gov_pbft.update_stakes_from_metagraph(&validators);
+
+        assert_eq!(
+            gov_pbft.governance.stake_governance().total_stake().0,
+            300_000_000_000
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_sudo_action_bootstrap_non_owner() {
+        let keypair = Keypair::generate();
+        let state = Arc::new(RwLock::new(ChainState::new(
+            keypair.hotkey(),
+            platform_core::NetworkConfig::default(),
+        )));
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let pbft = Arc::new(PBFTEngine::new(keypair.clone(), state.clone(), tx));
+
+        let gov_pbft = GovernancePBFT::new(pbft, state, keypair);
+
+        gov_pbft.set_block_height(1000); // In bootstrap period
+
+        let action = SudoAction::UpdateConfig {
+            config: platform_core::NetworkConfig::default(),
+        };
+
+        let result = gov_pbft.execute_sudo_action(action).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_governance_status() {
+        let keypair = Keypair::generate();
+        let state = Arc::new(RwLock::new(ChainState::new(
+            keypair.hotkey(),
+            platform_core::NetworkConfig::default(),
+        )));
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let pbft = Arc::new(PBFTEngine::new(keypair.clone(), state.clone(), tx));
+
+        let gov_pbft = GovernancePBFT::new(pbft, state, keypair);
+
+        let status = gov_pbft.governance_status();
+        assert_eq!(status.current_block, 0);
+        assert!(status.is_bootstrap_period);
+    }
+
+    #[tokio::test]
+    async fn test_active_proposals() {
+        let keypair = Keypair::generate();
+        let state = Arc::new(RwLock::new(ChainState::new(
+            keypair.hotkey(),
+            platform_core::NetworkConfig::default(),
+        )));
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let pbft = Arc::new(PBFTEngine::new(keypair.clone(), state.clone(), tx));
+
+        let gov_pbft = GovernancePBFT::new(pbft, state, keypair);
+
+        let proposals = gov_pbft.active_proposals();
+        assert_eq!(proposals.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_stake_for_consensus() {
+        let keypair = Keypair::generate();
+        let state = Arc::new(RwLock::new(ChainState::new(
+            keypair.hotkey(),
+            platform_core::NetworkConfig::default(),
+        )));
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let pbft = Arc::new(PBFTEngine::new(keypair.clone(), state.clone(), tx));
+
+        let gov_pbft = GovernancePBFT::new(pbft, state, keypair);
+
+        let (required, threshold) = gov_pbft.stake_for_consensus();
+        assert_eq!(threshold, crate::stake_governance::STAKE_THRESHOLD_PERCENT);
+    }
+
+    #[tokio::test]
+    async fn test_execute_sudo_action_post_bootstrap() {
+        let keypair = Keypair::generate();
+        let state = Arc::new(RwLock::new(ChainState::new(
+            keypair.hotkey(),
+            platform_core::NetworkConfig::default(),
+        )));
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let pbft = Arc::new(PBFTEngine::new(keypair.clone(), state.clone(), tx));
+
+        let gov_pbft = GovernancePBFT::new(pbft, state, keypair);
+        gov_pbft.set_block_height(crate::stake_governance::BOOTSTRAP_END_BLOCK + 1);
+
+        // Add stake for the validator
+        let validators = vec![ValidatorInfo::new(
+            gov_pbft.keypair.hotkey(),
+            Stake(100_000_000_000),
+        )];
+        gov_pbft.update_stakes_from_metagraph(&validators);
+
+        let action = SudoAction::UpdateConfig {
+            config: platform_core::NetworkConfig::default(),
+        };
+
+        let result = gov_pbft.execute_sudo_action(action).await;
+        assert!(result.is_ok());
+        assert!(matches!(
+            result.unwrap(),
+            SudoExecutionResult::ProposalCreated { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_can_use_bootstrap_false() {
+        let keypair = Keypair::generate();
+        let state = Arc::new(RwLock::new(ChainState::new(
+            keypair.hotkey(),
+            platform_core::NetworkConfig::default(),
+        )));
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let pbft = Arc::new(PBFTEngine::new(keypair.clone(), state.clone(), tx));
+
+        let gov_pbft = GovernancePBFT::new(pbft, state, keypair);
+        gov_pbft.set_block_height(1000);
+
+        assert!(!gov_pbft.can_use_bootstrap());
+    }
 }

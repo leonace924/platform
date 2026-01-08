@@ -857,4 +857,237 @@ mod tests {
         assert_eq!(status.validator_count, 5);
         assert_eq!(status.threshold, 2); // ceil(5 * 0.33) = 2
     }
+
+    #[tokio::test]
+    async fn test_propose_block_flow() {
+        let (engine, mut rx) = create_test_engine();
+
+        // Add validators
+        {
+            let mut state = engine.chain_state.write();
+            for _ in 0..3 {
+                let kp = Keypair::generate();
+                let info = ValidatorInfo::new(kp.hotkey(), Stake::new(10_000_000_000));
+                state.add_validator(info).unwrap();
+            }
+        }
+        engine.sync_validators();
+
+        let result = engine.propose_block().await;
+        assert!(result.is_ok());
+
+        // Should broadcast proposal and vote
+        let _proposal_msg = rx.recv().await;
+        let _vote_msg = rx.recv().await;
+    }
+
+    #[tokio::test]
+    async fn test_handle_consensus_result_rejected() {
+        let (engine, _rx) = create_test_engine();
+
+        let proposal_id = uuid::Uuid::new_v4();
+        let result = ConsensusResult::Rejected {
+            proposal_id,
+            reason: "Test rejection".to_string(),
+        };
+
+        // Should not panic
+        let res = engine.handle_consensus_result(result).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_consensus_result_pending() {
+        let (engine, _rx) = create_test_engine();
+
+        let result = ConsensusResult::Pending;
+
+        // Should not panic
+        let res = engine.handle_consensus_result(result).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_apply_sudo_action_refresh_challenges_with_id() {
+        let (engine, _rx) = create_test_engine();
+
+        let challenge_id = platform_core::ChallengeId::new();
+        let action = SudoAction::RefreshChallenges {
+            challenge_id: Some(challenge_id),
+        };
+
+        let mut state = engine.chain_state.write();
+        let result = engine.apply_sudo_action(&mut state, action);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_apply_sudo_action_refresh_challenges_all() {
+        let (engine, _rx) = create_test_engine();
+
+        let action = SudoAction::RefreshChallenges { challenge_id: None };
+
+        let mut state = engine.chain_state.write();
+        let result = engine.apply_sudo_action(&mut state, action);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_apply_sudo_action_add_validator() {
+        let (engine, _rx) = create_test_engine();
+
+        let new_val = ValidatorInfo::new(Hotkey([55u8; 32]), Stake::new(100_000_000_000));
+        let action = SudoAction::AddValidator {
+            info: new_val.clone(),
+        };
+
+        let mut state = engine.chain_state.write();
+        let result = engine.apply_sudo_action(&mut state, action);
+        assert!(result.is_ok());
+        assert!(state.get_validator(&new_val.hotkey).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_apply_sudo_action_remove_validator() {
+        let (engine, _rx) = create_test_engine();
+
+        let hotkey = Hotkey([66u8; 32]);
+
+        // Add then remove
+        {
+            let mut state = engine.chain_state.write();
+            let val = ValidatorInfo::new(hotkey.clone(), Stake::new(100_000_000_000));
+            state.add_validator(val).unwrap();
+        }
+
+        let action = SudoAction::RemoveValidator {
+            hotkey: hotkey.clone(),
+        };
+
+        let mut state = engine.chain_state.write();
+        let result = engine.apply_sudo_action(&mut state, action);
+        assert!(result.is_ok());
+        assert!(state.get_validator(&hotkey).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_apply_sudo_action_set_required_version() {
+        let (engine, _rx) = create_test_engine();
+
+        let action = SudoAction::SetRequiredVersion {
+            min_version: "2.0.0".to_string(),
+            recommended_version: "2.1.0".to_string(),
+            docker_image: "validator:2.0.0".to_string(),
+            mandatory: true,
+            deadline_block: Some(100000),
+            release_notes: Some("Important update".to_string()),
+        };
+
+        let mut state = engine.chain_state.write();
+        let result = engine.apply_sudo_action(&mut state, action);
+        assert!(result.is_ok());
+        assert!(state.required_version.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_propose_sudo_non_sudo() {
+        let (engine, _rx) = create_test_engine();
+
+        // Create a different keypair (non-sudo)
+        let non_sudo = Keypair::generate();
+        let state = Arc::new(RwLock::new(ChainState::new(
+            engine.keypair.hotkey(),
+            NetworkConfig::default(),
+        )));
+        let (tx, _rx2) = mpsc::channel(100);
+        let non_sudo_engine = PBFTEngine::new(non_sudo, state, tx);
+
+        let action = SudoAction::Resume;
+        let result = non_sudo_engine.propose_sudo(action).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_vote_wrong_voter() {
+        let (engine, _rx) = create_test_engine();
+
+        let proposal_id = uuid::Uuid::new_v4();
+        let wrong_hotkey = Keypair::generate().hotkey();
+        let vote = Vote::approve(proposal_id, wrong_hotkey.clone());
+
+        // Try to handle vote signed by different key
+        let actual_signer = Keypair::generate().hotkey();
+        let result = engine.handle_vote(vote, &actual_signer).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_apply_sudo_action_add_challenge_full() {
+        let (engine, _rx) = create_test_engine();
+
+        let config = platform_core::ChallengeContainerConfig::new(
+            "NewChallenge",
+            "ghcr.io/platformnetwork/new:latest",
+            2,
+            0.3,
+        );
+        let challenge_id = config.challenge_id;
+        let action = SudoAction::AddChallenge {
+            config: config.clone(),
+        };
+
+        let mut state = engine.chain_state.write();
+        let result = engine.apply_sudo_action(&mut state, action);
+        assert!(result.is_ok());
+        assert!(state.challenge_configs.contains_key(&challenge_id));
+        assert_eq!(state.challenge_configs[&challenge_id].name, "NewChallenge");
+    }
+
+    #[tokio::test]
+    async fn test_apply_sudo_action_update_challenge_full() {
+        let (engine, _rx) = create_test_engine();
+
+        let config = platform_core::ChallengeContainerConfig::new(
+            "UpdatedChallenge",
+            "ghcr.io/platformnetwork/updated:v2",
+            3,
+            0.4,
+        );
+        let challenge_id = config.challenge_id;
+
+        let action = SudoAction::UpdateChallenge {
+            config: config.clone(),
+        };
+
+        let mut state = engine.chain_state.write();
+        let result = engine.apply_sudo_action(&mut state, action);
+        assert!(result.is_ok());
+        assert!(state.challenge_configs.contains_key(&challenge_id));
+    }
+
+    #[tokio::test]
+    async fn test_apply_sudo_action_remove_challenge_full() {
+        let (engine, _rx) = create_test_engine();
+
+        let config = platform_core::ChallengeContainerConfig::new(
+            "ToRemove",
+            "ghcr.io/platformnetwork/remove:latest",
+            1,
+            0.2,
+        );
+        let challenge_id = config.challenge_id;
+
+        // First add the challenge
+        {
+            let mut state = engine.chain_state.write();
+            state.challenge_configs.insert(challenge_id, config);
+        }
+
+        let action = SudoAction::RemoveChallenge { id: challenge_id };
+
+        let mut state = engine.chain_state.write();
+        let result = engine.apply_sudo_action(&mut state, action);
+        assert!(result.is_ok());
+        assert!(!state.challenge_configs.contains_key(&challenge_id));
+    }
 }
