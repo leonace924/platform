@@ -31,8 +31,8 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 # Bittensor (with CRv4 timelock encryption support and new Subtensor API)
-# Updated to 453ce56: proper SCALE decoding for stake (includes parent inheritance)
-bittensor-rs = { git = "https://github.com/CortexLM/bittensor-rs", rev = "453ce56" }
+# Updated to 9cf5991: export get_tempo and get_reveal_period functions
+bittensor-rs = { git = "https://github.com/CortexLM/bittensor-rs", rev = "9cf5991" }
 
 # Async runtime
 tokio = { version = "1.40", features = ["full", "sync", "macros", "rt-multi-thread"] }

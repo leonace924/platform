@@ -498,6 +498,7 @@ pub struct ValidatorEvent {
 pub struct NetworkStateEvent {
     pub current_epoch: u64,
     pub current_block: u64,
+    pub tempo: u64,
     pub total_stake: u64,
     pub active_validators: u32,
     pub pending_submissions: u32,

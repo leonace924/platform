@@ -39,5 +39,8 @@ pub use bittensor_rs::{
     WeightResponseData,
 };
 
+// Re-export tempo/epoch functions
+pub use bittensor_rs::{get_reveal_period, get_tempo};
+
 // Re-export chain types needed for weight submission
 pub use bittensor_rs::chain::{signer_from_seed, BittensorSigner, ExtrinsicWait};

@@ -59,6 +59,9 @@ impl Default for MetricsCache {
     }
 }
 
+/// Default tempo (blocks per epoch) - Bittensor default
+pub const DEFAULT_TEMPO: u64 = 360;
+
 pub struct AppState {
     pub db: DbPool,
     pub sessions: DashMap<String, crate::models::AuthSession>,
@@ -72,6 +75,10 @@ pub struct AppState {
     pub validator_whitelist: RwLock<HashSet<String>>,
     /// In-memory cache for validator metrics
     pub metrics_cache: MetricsCache,
+    /// Cached tempo (blocks per epoch) from Bittensor
+    pub tempo: RwLock<u64>,
+    /// Current block number from Bittensor
+    pub current_block: RwLock<u64>,
 }
 
 impl AppState {
@@ -92,6 +99,8 @@ impl AppState {
             metagraph: RwLock::new(metagraph),
             validator_whitelist: RwLock::new(HashSet::new()),
             metrics_cache: MetricsCache::new(),
+            tempo: RwLock::new(DEFAULT_TEMPO),
+            current_block: RwLock::new(0),
         }
     }
 
@@ -112,7 +121,29 @@ impl AppState {
             metagraph: RwLock::new(metagraph),
             validator_whitelist: RwLock::new(validator_whitelist.into_iter().collect()),
             metrics_cache: MetricsCache::new(),
+            tempo: RwLock::new(DEFAULT_TEMPO),
+            current_block: RwLock::new(0),
         }
+    }
+
+    /// Set tempo (called when syncing with Bittensor)
+    pub fn set_tempo(&self, tempo: u64) {
+        *self.tempo.write() = tempo;
+    }
+
+    /// Get cached tempo
+    pub fn get_tempo(&self) -> u64 {
+        *self.tempo.read()
+    }
+
+    /// Set current block
+    pub fn set_current_block(&self, block: u64) {
+        *self.current_block.write() = block;
+    }
+
+    /// Get current block
+    pub fn get_current_block(&self) -> u64 {
+        *self.current_block.read()
     }
 
     /// Get validator stake from metagraph (returns 0 if not found)

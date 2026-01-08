@@ -108,30 +108,49 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     let db = db::init_db(&args.database_url).await?;
     info!("Database: platform_server");
 
-    // Sync metagraph BEFORE accepting connections (blocking)
+    // Sync metagraph and fetch tempo BEFORE accepting connections (blocking)
     info!("Syncing metagraph (netuid={})...", args.netuid);
-    let metagraph = match platform_bittensor::BittensorClient::new(&args.subtensor_endpoint).await {
-        Ok(client) => match platform_bittensor::sync_metagraph(&client, args.netuid).await {
-            Ok(mg) => {
-                info!("Metagraph synced: {} neurons", mg.n);
-                Some(mg)
+    let (metagraph, tempo) =
+        match platform_bittensor::BittensorClient::new(&args.subtensor_endpoint).await {
+            Ok(client) => {
+                // Fetch tempo from chain
+                let tempo = match platform_bittensor::get_tempo(&client, args.netuid).await {
+                    Ok(t) => {
+                        info!("Tempo fetched from chain: {}", t);
+                        t as u64
+                    }
+                    Err(e) => {
+                        warn!("Failed to fetch tempo: {} (using default 360)", e);
+                        360u64
+                    }
+                };
+
+                // Sync metagraph
+                let metagraph = match platform_bittensor::sync_metagraph(&client, args.netuid).await
+                {
+                    Ok(mg) => {
+                        info!("Metagraph synced: {} neurons", mg.n);
+                        Some(mg)
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Metagraph sync failed: {} (validators will have stake=0)",
+                            e
+                        );
+                        None
+                    }
+                };
+
+                (metagraph, tempo)
             }
             Err(e) => {
                 warn!(
-                    "Metagraph sync failed: {} (validators will have stake=0)",
+                    "Could not connect to subtensor: {} (validators will have stake=0, tempo=360)",
                     e
                 );
-                None
+                (None, 360u64)
             }
-        },
-        Err(e) => {
-            warn!(
-                "Could not connect to subtensor: {} (validators will have stake=0)",
-                e
-            );
-            None
-        }
-    };
+        };
 
     // Initialize challenge orchestrator
     info!("Initializing Challenge Orchestrator...");
@@ -156,6 +175,10 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         challenge_manager.clone(),
         metagraph,
     ));
+
+    // Set cached tempo from Bittensor
+    state.set_tempo(tempo);
+    info!("Tempo cached: {} blocks per epoch", tempo);
 
     // Build router
     let app = Router::new()
