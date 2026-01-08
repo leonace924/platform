@@ -1204,6 +1204,37 @@ mod tests {
         (kp, stake)
     }
 
+    // Test-only helpers to reduce coupling to internal fields
+    impl StakeGovernance {
+        #[cfg(test)]
+        fn mark_expired_for_test(&self, proposal_id: Uuid) {
+            if let Some(proposal) = self.proposals.write().get_mut(&proposal_id) {
+                proposal.expires_at = Utc::now() - Duration::hours(1);
+            }
+        }
+
+        #[cfg(test)]
+        fn mark_executed_for_test(&self, proposal_id: Uuid) {
+            if let Some(proposal) = self.proposals.write().get_mut(&proposal_id) {
+                proposal.executed = true;
+            }
+        }
+
+        #[cfg(test)]
+        fn mark_cancelled_for_test(&self, proposal_id: Uuid) {
+            if let Some(proposal) = self.proposals.write().get_mut(&proposal_id) {
+                proposal.cancelled = true;
+            }
+        }
+
+        #[cfg(test)]
+        fn set_rate_limit_for_test(&self, hotkey: &Hotkey, count: usize, timestamp: DateTime<Utc>) {
+            self.proposal_counts
+                .write()
+                .insert(hotkey.clone(), (timestamp, count));
+        }
+    }
+
     #[test]
     fn test_is_subnet_owner() {
         let owner = subnet_owner_hotkey();
@@ -1519,5 +1550,973 @@ mod tests {
             policy.owner_ss58(),
             "5GziQCcRpN8NCJktX343brnfuVe3w6gUYieeStXPD1Dag2At"
         );
+    }
+
+    #[test]
+    fn test_can_execute() {
+        let gov = create_test_governance();
+        gov.set_block_height(1000);
+        let owner = subnet_owner_hotkey();
+
+        // During bootstrap, owner can execute
+        let result = gov.execute_bootstrap_action(&owner, &GovernanceActionType::AddChallenge);
+        assert!(result.is_ok());
+
+        // After bootstrap, requires stake consensus
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+        let result = gov.execute_bootstrap_action(&owner, &GovernanceActionType::AddChallenge);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_execute_bootstrap_action_non_owner() {
+        let gov = create_test_governance();
+        gov.set_block_height(1000);
+        let (kp, _) = create_test_validator(1_000_000_000_000);
+
+        let result =
+            gov.execute_bootstrap_action(&kp.hotkey(), &GovernanceActionType::AddChallenge);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_proposal_no_stake() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(0);
+        gov.update_validator_stakes(vec![stake]);
+
+        let result = gov.create_proposal(
+            GovernanceActionType::AddChallenge,
+            "Test".to_string(),
+            "Test".to_string(),
+            vec![],
+            &kp.hotkey(),
+            &kp,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vote_on_expired_proposal() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(1_000_000_000_000);
+        gov.update_validator_stakes(vec![stake]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::UpdateConfig,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp.hotkey(),
+                &kp,
+            )
+            .unwrap();
+
+        // Mark proposal as expired using helper
+        gov.mark_expired_for_test(proposal.id);
+
+        let result = gov.vote(proposal.id, &kp.hotkey(), true, &kp);
+        assert!(matches!(
+            result.unwrap(),
+            StakeConsensusResult::Expired { .. }
+        ));
+    }
+
+    #[test]
+    fn test_vote_on_executed_proposal() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(1_000_000_000_000);
+        gov.update_validator_stakes(vec![stake]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::UpdateConfig,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp.hotkey(),
+                &kp,
+            )
+            .unwrap();
+
+        // Mark as executed using helper
+        gov.mark_executed_for_test(proposal.id);
+
+        let result = gov.vote(proposal.id, &kp.hotkey(), true, &kp);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vote_on_cancelled_proposal() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(1_000_000_000_000);
+        gov.update_validator_stakes(vec![stake]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::UpdateConfig,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp.hotkey(),
+                &kp,
+            )
+            .unwrap();
+
+        // Mark as cancelled using helper
+        gov.mark_cancelled_for_test(proposal.id);
+
+        let result = gov.vote(proposal.id, &kp.hotkey(), true, &kp);
+        assert!(matches!(
+            result.unwrap(),
+            StakeConsensusResult::Cancelled { .. }
+        ));
+    }
+
+    #[test]
+    fn test_vote_no_stake() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp1, stake1) = create_test_validator(1_000_000_000_000);
+        let (kp2, stake2) = create_test_validator(0);
+        // Register both validators, kp2 has zero stake
+        gov.update_validator_stakes(vec![stake1, stake2]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::UpdateConfig,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp1.hotkey(),
+                &kp1,
+            )
+            .unwrap();
+
+        // kp2 is a validator but has no stake, should fail
+        let result = gov.vote(proposal.id, &kp2.hotkey(), true, &kp2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vote_rejection() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        // Create validators with different stakes
+        let (kp1, stake1) = create_test_validator(200_000_000_000); // 20%
+        let (kp2, stake2) = create_test_validator(800_000_000_000); // 80%
+        gov.update_validator_stakes(vec![stake1, stake2]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::UpdateConfig,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp1.hotkey(),
+                &kp1,
+            )
+            .unwrap();
+
+        // kp2 (80% stake) votes NO
+        let result = gov.vote(proposal.id, &kp2.hotkey(), false, &kp2).unwrap();
+
+        // Should be rejected due to >33% stake voting NO (exceeds rejection threshold)
+        assert!(matches!(result, StakeConsensusResult::Rejected { .. }));
+    }
+
+    #[test]
+    fn test_vote_pending_before_voting_period() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(1_000_000_000_000);
+        gov.update_validator_stakes(vec![stake]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::UpdateConfig,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp.hotkey(),
+                &kp,
+            )
+            .unwrap();
+
+        // Vote immediately (before voting period completes)
+        let result = gov.check_consensus(proposal.id).unwrap();
+
+        // Should be pending even with 100% stake because voting period not complete
+        assert!(matches!(result, StakeConsensusResult::Pending { .. }));
+    }
+
+    #[test]
+    fn test_mark_executed() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(1_000_000_000_000);
+        gov.update_validator_stakes(vec![stake]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::UpdateConfig,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp.hotkey(),
+                &kp,
+            )
+            .unwrap();
+
+        assert!(gov.mark_executed(proposal.id).is_ok());
+
+        // Should not be able to execute again
+        let result = gov.mark_executed(proposal.id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cancel_proposal_by_proposer() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(1_000_000_000_000);
+        gov.update_validator_stakes(vec![stake]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::UpdateConfig,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp.hotkey(),
+                &kp,
+            )
+            .unwrap();
+
+        assert!(gov.cancel_proposal(proposal.id, &kp.hotkey()).is_ok());
+
+        // Verify cancelled
+        let p = gov.get_proposal(proposal.id).unwrap();
+        assert!(p.cancelled);
+    }
+
+    #[test]
+    fn test_cancel_proposal_by_owner() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(1_000_000_000_000);
+        gov.update_validator_stakes(vec![stake]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::UpdateConfig,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp.hotkey(),
+                &kp,
+            )
+            .unwrap();
+
+        let owner = subnet_owner_hotkey();
+        assert!(gov.cancel_proposal(proposal.id, &owner).is_ok());
+    }
+
+    #[test]
+    fn test_cancel_proposal_unauthorized() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp1, stake1) = create_test_validator(1_000_000_000_000);
+        let (kp2, stake2) = create_test_validator(500_000_000_000);
+        gov.update_validator_stakes(vec![stake1, stake2]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::UpdateConfig,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp1.hotkey(),
+                &kp1,
+            )
+            .unwrap();
+
+        // kp2 cannot cancel kp1's proposal
+        let result = gov.cancel_proposal(proposal.id, &kp2.hotkey());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cancel_executed_proposal() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(1_000_000_000_000);
+        gov.update_validator_stakes(vec![stake]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::UpdateConfig,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp.hotkey(),
+                &kp,
+            )
+            .unwrap();
+
+        gov.mark_executed(proposal.id).unwrap();
+
+        let result = gov.cancel_proposal(proposal.id, &kp.hotkey());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_proposal() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(1_000_000_000_000);
+        gov.update_validator_stakes(vec![stake]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::UpdateConfig,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp.hotkey(),
+                &kp,
+            )
+            .unwrap();
+
+        let retrieved = gov.get_proposal(proposal.id);
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().id, proposal.id);
+
+        let non_existent = gov.get_proposal(uuid::Uuid::new_v4());
+        assert!(non_existent.is_none());
+    }
+
+    #[test]
+    fn test_get_votes() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp1, stake1) = create_test_validator(600_000_000_000);
+        let (kp2, stake2) = create_test_validator(400_000_000_000);
+        gov.update_validator_stakes(vec![stake1, stake2]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::UpdateConfig,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp1.hotkey(),
+                &kp1,
+            )
+            .unwrap();
+
+        // Vote from kp2
+        gov.vote(proposal.id, &kp2.hotkey(), true, &kp2).unwrap();
+
+        let votes = gov.get_votes(proposal.id);
+        // Should have 1 vote: kp2
+        assert_eq!(votes.len(), 1);
+    }
+
+    #[test]
+    fn test_cleanup_expired() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(1_000_000_000_000);
+        gov.update_validator_stakes(vec![stake]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::UpdateConfig,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp.hotkey(),
+                &kp,
+            )
+            .unwrap();
+
+        // Mark as expired using helper
+        gov.mark_expired_for_test(proposal.id);
+
+        gov.cleanup_expired();
+
+        // Should be removed
+        assert!(gov.get_proposal(proposal.id).is_none());
+    }
+
+    #[test]
+    fn test_check_rate_limit() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(1_000_000_000_000);
+        gov.update_validator_stakes(vec![stake.clone()]);
+
+        // Create MAX_PROPOSALS_PER_DAY proposals
+        for i in 0..MAX_PROPOSALS_PER_DAY {
+            let result = gov.create_proposal(
+                GovernanceActionType::UpdateConfig,
+                format!("Test {}", i),
+                "Test".to_string(),
+                vec![],
+                &kp.hotkey(),
+                &kp,
+            );
+            assert!(result.is_ok());
+        }
+
+        // Next proposal should fail due to rate limit
+        let result = gov.create_proposal(
+            GovernanceActionType::UpdateConfig,
+            "Too many".to_string(),
+            "Test".to_string(),
+            vec![],
+            &kp.hotkey(),
+            &kp,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_rate_limit_resets_daily() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(1_000_000_000_000);
+        gov.update_validator_stakes(vec![stake]);
+
+        // Create a proposal
+        let result = gov.create_proposal(
+            GovernanceActionType::UpdateConfig,
+            "Test 1".to_string(),
+            "Test".to_string(),
+            vec![],
+            &kp.hotkey(),
+            &kp,
+        );
+        assert!(result.is_ok());
+
+        // Set rate limit to yesterday using helper
+        let yesterday = chrono::Utc::now() - chrono::Duration::days(1);
+        gov.set_rate_limit_for_test(&kp.hotkey(), 1, yesterday);
+
+        // Should be able to create another proposal (counter reset)
+        let result = gov.create_proposal(
+            GovernanceActionType::UpdateConfig,
+            "Test 2".to_string(),
+            "Test".to_string(),
+            vec![],
+            &kp.hotkey(),
+            &kp,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_can_use_bootstrap() {
+        let gov = create_test_governance();
+        let owner = subnet_owner_hotkey();
+        let other = Hotkey([42u8; 32]);
+
+        // During bootstrap, owner can use bootstrap
+        gov.set_block_height(1000);
+        assert!(gov.can_use_bootstrap(&owner));
+        assert!(!gov.can_use_bootstrap(&other));
+
+        // After bootstrap, no one can use bootstrap
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+        assert!(!gov.can_use_bootstrap(&owner));
+        assert!(!gov.can_use_bootstrap(&other));
+    }
+
+    #[test]
+    fn test_default_stake_governance() {
+        let gov = StakeGovernance::default();
+        assert_eq!(gov.block_height(), 0);
+        assert_eq!(gov.total_stake().0, 0);
+    }
+
+    #[test]
+    fn test_bootstrap_sync_policy_default() {
+        let policy = BootstrapSyncPolicy::default();
+        assert_eq!(policy.current_block, 0);
+        assert!(policy.is_bootstrap_active());
+    }
+
+    #[test]
+    fn test_bootstrap_sync_policy_owner_hotkey() {
+        let policy = BootstrapSyncPolicy::new(1000);
+        assert_eq!(policy.owner_hotkey(), &subnet_owner_hotkey());
+    }
+
+    #[test]
+    fn test_check_authorization_not_owner() {
+        let stake_gov = Arc::new(StakeGovernance::new());
+        stake_gov.set_block_height(1000); // During bootstrap
+
+        let hybrid = HybridGovernance::new(stake_gov);
+        let non_owner = Hotkey([42u8; 32]);
+
+        let result = hybrid.check_authorization(&non_owner, &GovernanceActionType::AddChallenge);
+        assert!(matches!(
+            result,
+            AuthorizationResult::BootstrapOwnerOnly { .. }
+        ));
+    }
+
+    #[test]
+    fn test_check_authorization_insufficient_stake() {
+        let stake_gov = Arc::new(StakeGovernance::new());
+        stake_gov.set_block_height(BOOTSTRAP_END_BLOCK + 1); // After bootstrap
+
+        let hybrid = HybridGovernance::new(stake_gov);
+        let no_stake = Hotkey([42u8; 32]);
+
+        let result = hybrid.check_authorization(&no_stake, &GovernanceActionType::AddChallenge);
+        assert!(matches!(
+            result,
+            AuthorizationResult::InsufficientStake { .. }
+        ));
+    }
+
+    #[test]
+    fn test_execute_with_authorization_bootstrap() {
+        let stake_gov = Arc::new(StakeGovernance::new());
+        stake_gov.set_block_height(1000);
+
+        let hybrid = HybridGovernance::new(stake_gov);
+        let owner = subnet_owner_hotkey();
+
+        let mut executed = false;
+        let result =
+            hybrid.execute_with_authorization(&owner, GovernanceActionType::AddChallenge, || {
+                executed = true;
+                Ok(())
+            });
+
+        assert!(result.is_ok());
+        assert!(executed);
+        assert!(matches!(
+            result.unwrap(),
+            ExecutionResult::ExecutedViaBootstrap { .. }
+        ));
+    }
+
+    #[test]
+    fn test_execute_with_authorization_requires_proposal() {
+        let stake_gov = Arc::new(StakeGovernance::new());
+        stake_gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(1_000_000_000_000);
+        stake_gov.update_validator_stakes(vec![stake]);
+
+        let hybrid = HybridGovernance::new(stake_gov);
+
+        let mut executed = false;
+        let result = hybrid.execute_with_authorization(
+            &kp.hotkey(),
+            GovernanceActionType::AddChallenge,
+            || {
+                executed = true;
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert!(!executed); // Should not execute, requires proposal
+        assert!(matches!(
+            result.unwrap(),
+            ExecutionResult::RequiresProposal { .. }
+        ));
+    }
+
+    #[test]
+    fn test_execute_with_authorization_bootstrap_non_owner() {
+        let stake_gov = Arc::new(StakeGovernance::new());
+        stake_gov.set_block_height(1000);
+
+        let hybrid = HybridGovernance::new(stake_gov);
+        let non_owner = Hotkey([42u8; 32]);
+
+        let result = hybrid.execute_with_authorization(
+            &non_owner,
+            GovernanceActionType::AddChallenge,
+            || Ok(()),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_execute_with_authorization_no_stake() {
+        let stake_gov = Arc::new(StakeGovernance::new());
+        stake_gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let hybrid = HybridGovernance::new(stake_gov);
+        let no_stake = Hotkey([42u8; 32]);
+
+        let result = hybrid.execute_with_authorization(
+            &no_stake,
+            GovernanceActionType::AddChallenge,
+            || Ok(()),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_stake_governance_constructor() {
+        let gov = StakeGovernance::new();
+        assert_eq!(gov.block_height(), 0);
+        assert_eq!(gov.total_stake().0, 0);
+        assert!(gov.is_bootstrap_period());
+        assert_eq!(gov.active_proposals().len(), 0);
+    }
+
+    #[test]
+    fn test_check_consensus_no_validators() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, _) = create_test_validator(0);
+
+        // Create proposal without any validators having stake
+        // Note: Direct field access used here because create_proposal would fail
+        // due to the no-stake validation check, which is what we're testing
+        let proposal_id = uuid::Uuid::new_v4();
+        let proposal = GovernanceProposal::new(
+            GovernanceActionType::UpdateConfig,
+            "Test".to_string(),
+            "Test".to_string(),
+            vec![],
+            kp.hotkey(),
+            0,
+        );
+        gov.proposals.write().insert(proposal_id, proposal);
+
+        let result = gov.check_consensus(proposal_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_proposal_voting_period_not_complete() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp1, stake1) = create_test_validator(600_000_000_000);
+        let (kp2, stake2) = create_test_validator(400_000_000_000);
+        gov.update_validator_stakes(vec![stake1, stake2]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::UpdateConfig,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp1.hotkey(),
+                &kp1,
+            )
+            .unwrap();
+
+        // Vote immediately with kp2 to get enough stake
+        gov.vote(proposal.id, &kp2.hotkey(), true, &kp2).unwrap();
+
+        // Check consensus - should be pending because voting period not complete
+        let result = gov.check_consensus(proposal.id).unwrap();
+        assert!(matches!(result, StakeConsensusResult::Pending { .. }));
+    }
+
+    #[test]
+    fn test_double_vote_error() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(1_000_000_000_000);
+        gov.update_validator_stakes(vec![stake]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::UpdateConfig,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp.hotkey(),
+                &kp,
+            )
+            .unwrap();
+
+        // First vote
+        gov.vote(proposal.id, &kp.hotkey(), true, &kp).ok();
+
+        // Second vote should fail
+        let result = gov.vote(proposal.id, &kp.hotkey(), false, &kp);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_validator_stake_nonexistent() {
+        let gov = create_test_governance();
+
+        let hotkey = Hotkey([99u8; 32]);
+        let stake = gov.get_validator_stake(&hotkey);
+        assert!(stake.is_none());
+    }
+
+    #[test]
+    fn test_mark_executed_already_executed() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(1_000_000_000_000);
+        gov.update_validator_stakes(vec![stake]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::UpdateConfig,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp.hotkey(),
+                &kp,
+            )
+            .unwrap();
+
+        // Mark as executed twice
+        gov.mark_executed(proposal.id).ok();
+        let result = gov.mark_executed(proposal.id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cancel_proposal_not_found() {
+        let gov = create_test_governance();
+
+        let fake_id = uuid::Uuid::new_v4();
+        let hotkey = Hotkey([1u8; 32]);
+
+        let result = gov.cancel_proposal(fake_id, &hotkey);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_proposal_nonexistent() {
+        let gov = create_test_governance();
+
+        let fake_id = uuid::Uuid::new_v4();
+        let result = gov.get_proposal(fake_id);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_votes_no_votes() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(1_000_000_000_000);
+        gov.update_validator_stakes(vec![stake]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::UpdateConfig,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp.hotkey(),
+                &kp,
+            )
+            .unwrap();
+
+        let votes = gov.get_votes(proposal.id);
+        assert_eq!(votes.len(), 0);
+    }
+
+    #[test]
+    fn test_increment_proposal_count() {
+        let gov = create_test_governance();
+
+        let hotkey = Hotkey([1u8; 32]);
+        // Direct test of private method to verify rate limiting internals
+        gov.increment_proposal_count(&hotkey);
+
+        let counts = gov.proposal_counts.read();
+        assert!(counts.contains_key(&hotkey));
+        assert_eq!(counts.get(&hotkey).unwrap().1, 1);
+    }
+
+    #[test]
+    fn test_status_summary() {
+        let gov = create_test_governance();
+        gov.set_block_height(1000);
+
+        let (_, stake) = create_test_validator(500_000_000_000);
+        gov.update_validator_stakes(vec![stake]);
+
+        let status = gov.status();
+        assert_eq!(status.current_block, 1000);
+        assert!(status.is_bootstrap_period);
+        assert_eq!(status.total_stake.0, 500_000_000_000);
+        assert_eq!(status.validator_count, 1);
+    }
+
+    #[test]
+    fn test_vote_proposal_not_found() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(1_000_000_000_000);
+        gov.update_validator_stakes(vec![stake]);
+
+        let fake_id = uuid::Uuid::new_v4();
+        let result = gov.vote(fake_id, &kp.hotkey(), true, &kp);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_check_consensus_proposal_not_found() {
+        let gov = create_test_governance();
+
+        let fake_id = uuid::Uuid::new_v4();
+        let result = gov.check_consensus(fake_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_check_consensus_cancelled() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(1_000_000_000_000);
+        gov.update_validator_stakes(vec![stake]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::Resume,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp.hotkey(),
+                &kp,
+            )
+            .unwrap();
+
+        // Mark as cancelled using helper
+        gov.mark_cancelled_for_test(proposal.id);
+
+        let result = gov.check_consensus(proposal.id).unwrap();
+        assert!(matches!(result, StakeConsensusResult::Cancelled { .. }));
+    }
+
+    #[test]
+    fn test_check_consensus_expired() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp, stake) = create_test_validator(1_000_000_000_000);
+        gov.update_validator_stakes(vec![stake]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::Resume,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp.hotkey(),
+                &kp,
+            )
+            .unwrap();
+
+        // Expire the proposal using helper
+        gov.mark_expired_for_test(proposal.id);
+
+        let result = gov.check_consensus(proposal.id).unwrap();
+        assert!(matches!(result, StakeConsensusResult::Expired { .. }));
+    }
+
+    #[test]
+    fn test_check_consensus_rejection_threshold() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp1, stake1) = create_test_validator(200_000_000_000);
+        let (kp2, stake2) = create_test_validator(800_000_000_000);
+        gov.update_validator_stakes(vec![stake1, stake2]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::Resume,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp1.hotkey(),
+                &kp1,
+            )
+            .unwrap();
+
+        // kp2 votes NO with 80% stake
+        gov.vote(proposal.id, &kp2.hotkey(), false, &kp2).ok();
+
+        let result = gov.check_consensus(proposal.id).unwrap();
+        assert!(matches!(result, StakeConsensusResult::Rejected { .. }));
+    }
+
+    #[test]
+    fn test_check_consensus_pending_remaining_stake() {
+        let gov = create_test_governance();
+        gov.set_block_height(BOOTSTRAP_END_BLOCK + 1);
+
+        let (kp1, stake1) = create_test_validator(300_000_000_000);
+        let (kp2, stake2) = create_test_validator(700_000_000_000);
+        gov.update_validator_stakes(vec![stake1, stake2]);
+
+        let proposal = gov
+            .create_proposal(
+                GovernanceActionType::Resume,
+                "Test".to_string(),
+                "Test".to_string(),
+                vec![],
+                &kp1.hotkey(),
+                &kp1,
+            )
+            .unwrap();
+
+        // Only kp1 has "voted" (30% stake) - not enough
+        let result = gov.check_consensus(proposal.id).unwrap();
+        assert!(matches!(result, StakeConsensusResult::Pending { .. }));
+    }
+
+    #[test]
+    fn test_mark_executed_proposal_not_found() {
+        let gov = create_test_governance();
+
+        let fake_id = uuid::Uuid::new_v4();
+        let result = gov.mark_executed(fake_id);
+        assert!(result.is_err());
     }
 }

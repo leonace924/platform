@@ -226,4 +226,228 @@ mod tests {
 
         panic!("Should have been rejected");
     }
+
+    #[test]
+    fn test_completed_results() {
+        let state = ConsensusState::new(ConsensusConfig::default());
+        state.set_validator_count(4);
+
+        let proposer = Keypair::generate();
+        let proposal = Proposal::new(
+            ProposalAction::NewBlock {
+                state_hash: [0u8; 32],
+            },
+            proposer.hotkey(),
+            1,
+        );
+
+        let proposal_id = state.start_round(proposal);
+
+        // Add votes to reach consensus
+        for _ in 0..3 {
+            let voter = Keypair::generate();
+            let vote = Vote::approve(proposal_id, voter.hotkey());
+            state.add_vote(vote);
+        }
+
+        // Check completed results
+        let completed = state.completed_results();
+        assert_eq!(completed.len(), 1);
+        assert!(matches!(completed[0], ConsensusResult::Approved(_)));
+    }
+
+    #[test]
+    fn test_clear_completed() {
+        let state = ConsensusState::new(ConsensusConfig::default());
+        state.set_validator_count(4);
+
+        let proposer = Keypair::generate();
+        let proposal = Proposal::new(
+            ProposalAction::NewBlock {
+                state_hash: [0u8; 32],
+            },
+            proposer.hotkey(),
+            1,
+        );
+
+        let proposal_id = state.start_round(proposal);
+
+        // Add votes to reach consensus
+        for _ in 0..3 {
+            let voter = Keypair::generate();
+            let vote = Vote::approve(proposal_id, voter.hotkey());
+            state.add_vote(vote);
+        }
+
+        // Verify we have completed results
+        assert_eq!(state.completed_results().len(), 1);
+
+        // Clear completed
+        state.clear_completed();
+
+        // Verify cleared
+        assert_eq!(state.completed_results().len(), 0);
+    }
+
+    #[test]
+    fn test_get_round() {
+        let state = ConsensusState::new(ConsensusConfig::default());
+
+        let proposer = Keypair::generate();
+        let proposal = Proposal::new(
+            ProposalAction::NewBlock {
+                state_hash: [0u8; 32],
+            },
+            proposer.hotkey(),
+            1,
+        );
+
+        let proposal_id = state.start_round(proposal.clone());
+
+        // Get round
+        let round = state.get_round(&proposal_id);
+        assert!(round.is_some());
+        assert_eq!(round.unwrap().proposal.id, proposal_id);
+
+        // Non-existent round
+        let fake_id = uuid::Uuid::new_v4();
+        let non_existent = state.get_round(&fake_id);
+        assert!(non_existent.is_none());
+    }
+
+    #[test]
+    fn test_is_pending() {
+        let state = ConsensusState::new(ConsensusConfig::default());
+
+        let proposer = Keypair::generate();
+        let proposal = Proposal::new(
+            ProposalAction::NewBlock {
+                state_hash: [0u8; 32],
+            },
+            proposer.hotkey(),
+            1,
+        );
+
+        let proposal_id = state.start_round(proposal);
+
+        assert!(state.is_pending(&proposal_id));
+
+        let fake_id = uuid::Uuid::new_v4();
+        assert!(!state.is_pending(&fake_id));
+    }
+
+    #[test]
+    fn test_active_rounds() {
+        let state = ConsensusState::new(ConsensusConfig::default());
+
+        // Initially empty
+        assert_eq!(state.active_rounds().len(), 0);
+
+        let proposer = Keypair::generate();
+        let proposal = Proposal::new(
+            ProposalAction::NewBlock {
+                state_hash: [0u8; 32],
+            },
+            proposer.hotkey(),
+            1,
+        );
+
+        state.start_round(proposal);
+
+        // Now has one active round
+        assert_eq!(state.active_rounds().len(), 1);
+    }
+
+    #[test]
+    fn test_check_timeouts_with_rounds() {
+        let state = ConsensusState::new(ConsensusConfig::default());
+
+        let proposer = Keypair::generate();
+        let proposal = Proposal::new(
+            ProposalAction::NewBlock {
+                state_hash: [0u8; 32],
+            },
+            proposer.hotkey(),
+            1,
+        );
+
+        state.start_round(proposal);
+
+        // Check timeouts (won't timeout immediately)
+        let timeouts = state.check_timeouts();
+        assert_eq!(timeouts.len(), 0);
+    }
+
+    #[test]
+    fn test_add_vote_to_nonexistent_round() {
+        let state = ConsensusState::new(ConsensusConfig::default());
+        state.set_validator_count(4);
+
+        let fake_id = uuid::Uuid::new_v4();
+        let voter = Keypair::generate();
+        let vote = Vote::approve(fake_id, voter.hotkey());
+
+        let result = state.add_vote(vote);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_add_vote_triggers_rejection() {
+        let state = ConsensusState::new(ConsensusConfig::default());
+        state.set_validator_count(4); // Threshold is ceil(4 * 0.33) = 2
+
+        let proposer = Keypair::generate();
+        let proposal = Proposal::new(
+            ProposalAction::NewBlock {
+                state_hash: [0u8; 32],
+            },
+            proposer.hotkey(),
+            1,
+        );
+
+        let proposal_id = state.start_round(proposal);
+
+        // Add 3 reject votes - makes consensus impossible
+        for _ in 0..3 {
+            let voter = Keypair::generate();
+            let vote = Vote::reject(proposal_id, voter.hotkey());
+            let result = state.add_vote(vote);
+
+            if let Some(ConsensusResult::Rejected { .. }) = result {
+                // Successfully triggered rejection
+                assert!(!state.is_pending(&proposal_id));
+                return;
+            }
+        }
+
+        // Should have been rejected
+        assert!(!state.is_pending(&proposal_id));
+    }
+
+    #[test]
+    fn test_add_vote_updates_phase() {
+        let state = ConsensusState::new(ConsensusConfig::default());
+        state.set_validator_count(10);
+
+        let proposer = Keypair::generate();
+        let proposal = Proposal::new(
+            ProposalAction::NewBlock {
+                state_hash: [0u8; 32],
+            },
+            proposer.hotkey(),
+            1,
+        );
+
+        let proposal_id = state.start_round(proposal);
+
+        // Add one approve vote - should update phase to Prepare
+        let voter = Keypair::generate();
+        let vote = Vote::approve(proposal_id, voter.hotkey());
+        state.add_vote(vote);
+
+        // Round should still be active and phase should be updated to Prepare
+        let round = state.get_round(&proposal_id);
+        assert!(round.is_some());
+        assert_eq!(round.unwrap().phase, ConsensusPhase::Prepare);
+    }
 }
