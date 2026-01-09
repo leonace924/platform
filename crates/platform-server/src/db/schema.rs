@@ -218,3 +218,91 @@ INSERT INTO network_state (key, value) VALUES
     ('challenge_id', '')
 ON CONFLICT (key) DO NOTHING;
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_schema_sql_contains_tables() {
+        // Verify that the schema SQL contains all expected table definitions
+        assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS validators"));
+        assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS challenge_config"));
+        assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS submissions"));
+        assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS evaluations"));
+        assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS leaderboard"));
+        assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS task_leases"));
+        assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS events"));
+        assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS network_state"));
+        assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS challenges"));
+        assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS evaluation_jobs"));
+    }
+
+    #[test]
+    fn test_schema_sql_contains_indexes() {
+        // Verify that the schema SQL contains index definitions
+        assert!(SCHEMA_SQL.contains("CREATE INDEX IF NOT EXISTS idx_submissions_miner"));
+        assert!(SCHEMA_SQL.contains("CREATE INDEX IF NOT EXISTS idx_submissions_epoch"));
+        assert!(SCHEMA_SQL.contains("CREATE INDEX IF NOT EXISTS idx_evaluations_agent"));
+        assert!(SCHEMA_SQL.contains("CREATE INDEX IF NOT EXISTS idx_leaderboard_rank"));
+        assert!(SCHEMA_SQL.contains("CREATE INDEX IF NOT EXISTS idx_task_leases_validator"));
+        assert!(SCHEMA_SQL.contains("CREATE INDEX IF NOT EXISTS idx_events_type"));
+        assert!(SCHEMA_SQL.contains("CREATE INDEX IF NOT EXISTS idx_challenges_status"));
+        assert!(SCHEMA_SQL.contains("CREATE INDEX IF NOT EXISTS idx_jobs_status"));
+    }
+
+    #[test]
+    fn test_schema_sql_contains_initial_data() {
+        // Verify initial network state data
+        assert!(SCHEMA_SQL.contains("INSERT INTO network_state"));
+        assert!(SCHEMA_SQL.contains("current_epoch"));
+        assert!(SCHEMA_SQL.contains("current_block"));
+        assert!(SCHEMA_SQL.contains("total_stake"));
+        assert!(SCHEMA_SQL.contains("challenge_id"));
+    }
+
+    #[test]
+    fn test_schema_sql_contains_foreign_keys() {
+        // Verify foreign key relationships
+        assert!(SCHEMA_SQL.contains("REFERENCES submissions(id)"));
+    }
+
+    #[test]
+    fn test_schema_sql_contains_unique_constraints() {
+        // Verify unique constraints
+        assert!(SCHEMA_SQL.contains("UNIQUE(submission_id, validator_hotkey)"));
+        assert!(SCHEMA_SQL.contains("agent_hash VARCHAR(128) NOT NULL UNIQUE"));
+    }
+
+    #[test]
+    fn test_schema_sql_default_values() {
+        // Verify default values are set correctly with specific column checks
+        assert!(SCHEMA_SQL.contains("status VARCHAR(32) DEFAULT 'pending'"));
+        assert!(SCHEMA_SQL.contains("status VARCHAR(32) DEFAULT 'active'"));
+        assert!(SCHEMA_SQL.contains("is_active BOOLEAN DEFAULT TRUE"));
+        assert!(SCHEMA_SQL.contains("stake BIGINT NOT NULL DEFAULT 0"));
+        assert!(SCHEMA_SQL.contains("gpu_required BOOLEAN DEFAULT FALSE"));
+        assert!(SCHEMA_SQL.contains("is_healthy BOOLEAN DEFAULT FALSE"));
+        assert!(SCHEMA_SQL.contains("DEFAULT NOW()"));
+    }
+
+    #[test]
+    fn test_schema_sql_jsonb_fields() {
+        // Verify JSONB columns exist for flexible data
+        assert!(SCHEMA_SQL.contains("module_whitelist JSONB"));
+        assert!(SCHEMA_SQL.contains("model_whitelist JSONB"));
+        assert!(SCHEMA_SQL.contains("pricing_config JSONB"));
+        assert!(SCHEMA_SQL.contains("evaluation_config JSONB"));
+        assert!(SCHEMA_SQL.contains("task_results JSONB"));
+        assert!(SCHEMA_SQL.contains("payload JSONB"));
+    }
+
+    #[test]
+    fn test_schema_sql_timestamp_fields() {
+        // Verify timestamp fields are properly defined
+        assert!(SCHEMA_SQL.contains("created_at TIMESTAMPTZ"));
+        assert!(SCHEMA_SQL.contains("updated_at TIMESTAMPTZ"));
+        assert!(SCHEMA_SQL.contains("expires_at TIMESTAMPTZ"));
+        assert!(SCHEMA_SQL.contains("last_seen TIMESTAMPTZ"));
+    }
+}

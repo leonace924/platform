@@ -183,3 +183,209 @@ impl AppState {
             .unwrap_or(false)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{AuthRole, AuthSession};
+
+    #[test]
+    fn test_validator_metrics_cache_new() {
+        let cache = MetricsCache::new();
+        let metrics = cache.get_all();
+        assert_eq!(metrics.len(), 0);
+    }
+
+    #[test]
+    fn test_validator_metrics_cache_update_and_get() {
+        let cache = MetricsCache::new();
+        let metrics = ValidatorMetrics {
+            cpu_percent: 50.0,
+            memory_used_mb: 1024,
+            memory_total_mb: 4096,
+            timestamp: 1234567890,
+        };
+
+        cache.update("hotkey1", metrics.clone());
+        let all_metrics = cache.get_all();
+
+        assert_eq!(all_metrics.len(), 1);
+        assert_eq!(all_metrics[0].0, "hotkey1");
+        assert_eq!(all_metrics[0].1.cpu_percent, 50.0);
+        assert_eq!(all_metrics[0].1.memory_used_mb, 1024);
+    }
+
+    #[test]
+    fn test_validator_metrics_cache_multiple_validators() {
+        let cache = MetricsCache::new();
+
+        let metrics1 = ValidatorMetrics {
+            cpu_percent: 50.0,
+            memory_used_mb: 1024,
+            memory_total_mb: 4096,
+            timestamp: 1234567890,
+        };
+
+        let metrics2 = ValidatorMetrics {
+            cpu_percent: 75.0,
+            memory_used_mb: 2048,
+            memory_total_mb: 8192,
+            timestamp: 1234567891,
+        };
+
+        cache.update("hotkey1", metrics1);
+        cache.update("hotkey2", metrics2);
+
+        let all_metrics = cache.get_all();
+        assert_eq!(all_metrics.len(), 2);
+    }
+
+    #[test]
+    fn test_validator_metrics_cache_update_existing() {
+        let cache = MetricsCache::new();
+
+        let metrics1 = ValidatorMetrics {
+            cpu_percent: 50.0,
+            memory_used_mb: 1024,
+            memory_total_mb: 4096,
+            timestamp: 1234567890,
+        };
+
+        let metrics2 = ValidatorMetrics {
+            cpu_percent: 60.0,
+            memory_used_mb: 2048,
+            memory_total_mb: 4096,
+            timestamp: 1234567891,
+        };
+
+        cache.update("hotkey1", metrics1);
+        cache.update("hotkey1", metrics2);
+
+        let all_metrics = cache.get_all();
+        assert_eq!(all_metrics.len(), 1);
+        assert_eq!(all_metrics[0].1.cpu_percent, 60.0);
+        assert_eq!(all_metrics[0].1.memory_used_mb, 2048);
+    }
+
+    #[test]
+    fn test_metrics_cache_default() {
+        let cache = MetricsCache::default();
+        let metrics = cache.get_all();
+        assert_eq!(metrics.len(), 0);
+    }
+
+    #[test]
+    fn test_default_tempo() {
+        assert_eq!(DEFAULT_TEMPO, 360);
+    }
+
+    #[test]
+    fn test_app_state_tempo_operations() {
+        let state = create_test_state();
+        
+        // Default tempo
+        assert_eq!(state.get_tempo(), DEFAULT_TEMPO);
+
+        // Set and get tempo
+        state.set_tempo(500);
+        assert_eq!(state.get_tempo(), 500);
+
+        state.set_tempo(1000);
+        assert_eq!(state.get_tempo(), 1000);
+    }
+
+    #[test]
+    fn test_app_state_current_block_operations() {
+        let state = create_test_state();
+
+        // Default block
+        assert_eq!(state.get_current_block(), 0);
+
+        // Set and get block
+        state.set_current_block(100);
+        assert_eq!(state.get_current_block(), 100);
+
+        state.set_current_block(500);
+        assert_eq!(state.get_current_block(), 500);
+    }
+
+    #[test]
+    fn test_app_state_validator_stake_whitelist() {
+        let state = create_test_state_with_whitelist(vec!["validator1".to_string()]);
+
+        // Whitelisted validator should have high stake
+        let stake = state.get_validator_stake("validator1");
+        assert_eq!(stake, 100_000_000_000_000);
+
+        // Non-whitelisted validator should have 0 stake
+        let stake = state.get_validator_stake("validator2");
+        assert_eq!(stake, 0);
+    }
+
+    #[test]
+    fn test_app_state_validator_stake_no_metagraph() {
+        let state = create_test_state();
+
+        // Without metagraph or whitelist, stake should be 0
+        let stake = state.get_validator_stake("any_validator");
+        assert_eq!(stake, 0);
+    }
+
+    #[test]
+    fn test_app_state_is_owner() {
+        let state = create_test_state_with_owner("owner_hotkey".to_string());
+
+        assert!(state.is_owner("owner_hotkey"));
+        assert!(!state.is_owner("other_hotkey"));
+    }
+
+    #[test]
+    fn test_app_state_is_owner_none() {
+        let state = create_test_state();
+
+        assert!(!state.is_owner("any_hotkey"));
+    }
+
+    #[test]
+    fn test_app_state_sessions() {
+        let state = create_test_state();
+
+        // Sessions should be empty initially
+        assert_eq!(state.sessions.len(), 0);
+
+        // Insert a session
+        state.sessions.insert(
+            "token1".to_string(),
+            AuthSession {
+                hotkey: "validator1".to_string(),
+                role: AuthRole::Validator,
+                expires_at: 9999999999,
+            },
+        );
+
+        assert_eq!(state.sessions.len(), 1);
+        assert!(state.sessions.contains_key("token1"));
+    }
+
+    // Helper functions for tests
+    fn create_test_pool() -> crate::db::DbPool {
+        use deadpool_postgres::{Config, Runtime};
+        use tokio_postgres::NoTls;
+
+        let mut cfg = Config::new();
+        cfg.url = Some("postgresql://localhost/test".to_string());
+        cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap()
+    }
+
+    fn create_test_state() -> AppState {
+        AppState::new_dynamic(create_test_pool(), None, None, None)
+    }
+
+    fn create_test_state_with_whitelist(whitelist: Vec<String>) -> AppState {
+        AppState::new_dynamic_with_whitelist(create_test_pool(), None, None, None, whitelist)
+    }
+
+    fn create_test_state_with_owner(owner: String) -> AppState {
+        AppState::new_dynamic(create_test_pool(), Some(owner), None, None)
+    }
+}

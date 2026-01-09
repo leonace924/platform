@@ -54,3 +54,21 @@ async fn create_pool(database_url: &str) -> Result<DbPool> {
     let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
     Ok(pool)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_db_pool_type() {
+        // Test that DbPool is correctly aliased to Pool
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let pool_result = create_pool("postgresql://localhost/test").await;
+            if let Ok(_pool) = pool_result {
+                // Pool type should match DbPool
+                let _typed: DbPool = _pool;
+            }
+        });
+    }
+}

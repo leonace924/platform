@@ -650,3 +650,337 @@ pub struct ChallengeActionRequest {
     pub signature: String,
     pub timestamp: i64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_submission_status_to_string() {
+        assert_eq!(SubmissionStatus::Pending.to_string(), "pending");
+        assert_eq!(SubmissionStatus::Evaluating.to_string(), "evaluating");
+        assert_eq!(SubmissionStatus::Completed.to_string(), "completed");
+        assert_eq!(SubmissionStatus::Failed.to_string(), "failed");
+        assert_eq!(SubmissionStatus::Rejected.to_string(), "rejected");
+    }
+
+    #[test]
+    fn test_submission_status_from_str() {
+        assert_eq!(SubmissionStatus::from("pending"), SubmissionStatus::Pending);
+        assert_eq!(
+            SubmissionStatus::from("evaluating"),
+            SubmissionStatus::Evaluating
+        );
+        assert_eq!(
+            SubmissionStatus::from("completed"),
+            SubmissionStatus::Completed
+        );
+        assert_eq!(SubmissionStatus::from("failed"), SubmissionStatus::Failed);
+        assert_eq!(
+            SubmissionStatus::from("rejected"),
+            SubmissionStatus::Rejected
+        );
+        // Default case
+        assert_eq!(SubmissionStatus::from("unknown"), SubmissionStatus::Pending);
+    }
+
+    #[test]
+    fn test_submission_status_equality() {
+        assert_eq!(SubmissionStatus::Pending, SubmissionStatus::Pending);
+        assert_ne!(SubmissionStatus::Pending, SubmissionStatus::Completed);
+    }
+
+    #[test]
+    fn test_challenge_status_equality() {
+        assert_eq!(ChallengeStatus::Active, ChallengeStatus::Active);
+        assert_ne!(ChallengeStatus::Active, ChallengeStatus::Paused);
+        assert_ne!(ChallengeStatus::Paused, ChallengeStatus::Deprecated);
+    }
+
+    #[test]
+    fn test_task_lease_status_equality() {
+        assert_eq!(TaskLeaseStatus::Active, TaskLeaseStatus::Active);
+        assert_ne!(TaskLeaseStatus::Active, TaskLeaseStatus::Completed);
+        assert_ne!(TaskLeaseStatus::Completed, TaskLeaseStatus::Failed);
+        assert_ne!(TaskLeaseStatus::Failed, TaskLeaseStatus::Expired);
+    }
+
+    #[test]
+    fn test_auth_role_equality() {
+        assert_eq!(AuthRole::Validator, AuthRole::Validator);
+        assert_ne!(AuthRole::Validator, AuthRole::Miner);
+        assert_ne!(AuthRole::Miner, AuthRole::Owner);
+        assert_ne!(AuthRole::Owner, AuthRole::Challenge);
+    }
+
+    #[test]
+    fn test_job_status_equality() {
+        assert_eq!(JobStatus::Pending, JobStatus::Pending);
+        assert_ne!(JobStatus::Pending, JobStatus::Assigned);
+        assert_ne!(JobStatus::Assigned, JobStatus::Running);
+        assert_ne!(JobStatus::Running, JobStatus::Completed);
+        assert_ne!(JobStatus::Completed, JobStatus::Failed);
+    }
+
+    #[test]
+    fn test_task_progress_status_equality() {
+        assert_eq!(TaskProgressStatus::Started, TaskProgressStatus::Started);
+        assert_ne!(TaskProgressStatus::Started, TaskProgressStatus::Running);
+        assert_ne!(TaskProgressStatus::Running, TaskProgressStatus::Passed);
+        assert_ne!(TaskProgressStatus::Passed, TaskProgressStatus::Failed);
+        assert_ne!(TaskProgressStatus::Failed, TaskProgressStatus::Skipped);
+    }
+
+    #[test]
+    fn test_registered_challenge_new() {
+        let challenge = RegisteredChallenge::new(
+            "test-challenge",
+            "Test Challenge",
+            "test-image:latest",
+        );
+
+        assert_eq!(challenge.id, "test-challenge");
+        assert_eq!(challenge.name, "Test Challenge");
+        assert_eq!(challenge.docker_image, "test-image:latest");
+        assert_eq!(challenge.mechanism_id, 1);
+        assert_eq!(challenge.emission_weight, 0.1);
+        assert_eq!(challenge.timeout_secs, 3600);
+        assert_eq!(challenge.cpu_cores, 2.0);
+        assert_eq!(challenge.memory_mb, 4096);
+        assert_eq!(challenge.gpu_required, false);
+        assert_eq!(challenge.status, "active");
+        assert_eq!(challenge.endpoint, None);
+        assert_eq!(challenge.container_id, None);
+        assert_eq!(challenge.last_health_check, None);
+        assert_eq!(challenge.is_healthy, false);
+    }
+
+    #[test]
+    fn test_default_functions() {
+        assert_eq!(default_mechanism_id(), 1);
+        assert_eq!(default_emission_weight(), 0.1);
+        assert_eq!(default_timeout(), 3600);
+        assert_eq!(default_cpu(), 2.0);
+        assert_eq!(default_memory(), 4096);
+    }
+
+    #[test]
+    fn test_validator_serialization() {
+        let validator = Validator {
+            hotkey: "test_hotkey".to_string(),
+            stake: 1000,
+            last_seen: Some(1234567890),
+            is_active: true,
+            created_at: 1234567800,
+        };
+
+        let json = serde_json::to_string(&validator).unwrap();
+        assert!(json.contains("test_hotkey"));
+        assert!(json.contains("1000"));
+
+        let deserialized: Validator = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.hotkey, "test_hotkey");
+        assert_eq!(deserialized.stake, 1000);
+    }
+
+    #[test]
+    fn test_submission_serialization() {
+        let submission = Submission {
+            id: "sub-123".to_string(),
+            agent_hash: "hash123".to_string(),
+            miner_hotkey: "miner1".to_string(),
+            source_code: Some("code".to_string()),
+            source_hash: "src_hash".to_string(),
+            name: Some("Agent 1".to_string()),
+            version: "1.0.0".to_string(),
+            epoch: 10,
+            status: SubmissionStatus::Pending,
+            api_key: Some("key123".to_string()),
+            api_provider: Some("openrouter".to_string()),
+            total_cost_usd: Some(1.5),
+            api_keys_encrypted: None,
+            created_at: 1234567890,
+        };
+
+        let json = serde_json::to_string(&submission).unwrap();
+        let deserialized: Submission = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.id, "sub-123");
+        assert_eq!(deserialized.agent_hash, "hash123");
+        assert_eq!(deserialized.status, SubmissionStatus::Pending);
+    }
+
+    #[test]
+    fn test_evaluation_serialization() {
+        let evaluation = Evaluation {
+            id: "eval-123".to_string(),
+            submission_id: "sub-123".to_string(),
+            agent_hash: "hash123".to_string(),
+            validator_hotkey: "validator1".to_string(),
+            score: 0.95,
+            tasks_passed: 19,
+            tasks_total: 20,
+            tasks_failed: 1,
+            total_cost_usd: 2.5,
+            execution_time_ms: Some(5000),
+            task_results: Some("results".to_string()),
+            execution_log: Some("log".to_string()),
+            created_at: 1234567890,
+        };
+
+        let json = serde_json::to_string(&evaluation).unwrap();
+        let deserialized: Evaluation = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.score, 0.95);
+        assert_eq!(deserialized.tasks_passed, 19);
+    }
+
+    #[test]
+    fn test_task_lease_serialization() {
+        let lease = TaskLease {
+            task_id: "task-123".to_string(),
+            validator_hotkey: "validator1".to_string(),
+            claimed_at: 1234567890,
+            expires_at: 1234568190,
+            status: TaskLeaseStatus::Active,
+        };
+
+        let json = serde_json::to_string(&lease).unwrap();
+        let deserialized: TaskLease = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.task_id, "task-123");
+        assert_eq!(deserialized.status, TaskLeaseStatus::Active);
+    }
+
+    #[test]
+    fn test_ws_event_serialization() {
+        let event = WsEvent::Ping;
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("ping"));
+
+        let event = WsEvent::Pong;
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("pong"));
+    }
+
+    #[test]
+    fn test_ws_event_submission_received() {
+        let event = WsEvent::SubmissionReceived(SubmissionEvent {
+            submission_id: "sub-123".to_string(),
+            agent_hash: "hash123".to_string(),
+            miner_hotkey: "miner1".to_string(),
+            name: Some("Agent 1".to_string()),
+            epoch: 10,
+        });
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("submission_received"));
+        assert!(json.contains("sub-123"));
+    }
+
+    #[test]
+    fn test_ws_event_task_claimed() {
+        let event = WsEvent::TaskClaimed(TaskClaimedEvent {
+            task_id: "task-123".to_string(),
+            validator_hotkey: "validator1".to_string(),
+            expires_at: 1234568190,
+        });
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("task_claimed"));
+        assert!(json.contains("task-123"));
+    }
+
+    #[test]
+    fn test_challenge_custom_event_serialization() {
+        let event = WsEvent::ChallengeEvent(ChallengeCustomEvent {
+            challenge_id: "test-challenge".to_string(),
+            event_name: "custom_event".to_string(),
+            payload: serde_json::json!({"key": "value"}),
+            timestamp: 1234567890,
+        });
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("challenge_event"));
+        assert!(json.contains("test-challenge"));
+        assert!(json.contains("custom_event"));
+    }
+
+    #[test]
+    fn test_auth_request_serialization() {
+        let request = AuthRequest {
+            hotkey: "validator1".to_string(),
+            timestamp: 1234567890,
+            signature: "sig123".to_string(),
+            role: AuthRole::Validator,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        let deserialized: AuthRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.hotkey, "validator1");
+        assert_eq!(deserialized.role, AuthRole::Validator);
+    }
+
+    #[test]
+    fn test_job_assigned_event_serialization() {
+        let event = WsEvent::JobAssigned(JobAssignedEvent {
+            job_id: "job-123".to_string(),
+            submission_id: "sub-123".to_string(),
+            agent_hash: "hash123".to_string(),
+            validator_hotkey: "validator1".to_string(),
+            challenge_id: "challenge-1".to_string(),
+        });
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("job_assigned"));
+        assert!(json.contains("job-123"));
+    }
+
+    #[test]
+    fn test_job_progress_event_serialization() {
+        let event = WsEvent::JobProgress(JobProgressEvent {
+            job_id: "job-123".to_string(),
+            validator_hotkey: "validator1".to_string(),
+            task_index: 5,
+            task_total: 10,
+            task_id: "task-5".to_string(),
+            status: TaskProgressStatus::Running,
+            message: Some("Running test".to_string()),
+        });
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("job_progress"));
+        assert!(json.contains("task-5"));
+    }
+
+    #[test]
+    fn test_challenge_registered_event_serialization() {
+        let event = WsEvent::ChallengeRegistered(ChallengeRegisteredEvent {
+            id: "challenge-1".to_string(),
+            name: "Test Challenge".to_string(),
+            docker_image: "test:latest".to_string(),
+            mechanism_id: 1,
+            emission_weight: 0.2,
+        });
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("challenge_registered"));
+        assert!(json.contains("Test Challenge"));
+    }
+
+    #[test]
+    fn test_challenge_started_event_serialization() {
+        let event = WsEvent::ChallengeStarted(ChallengeStartedEvent {
+            id: "challenge-1".to_string(),
+            endpoint: "http://localhost:8080".to_string(),
+            docker_image: "test:latest".to_string(),
+            mechanism_id: 1,
+            emission_weight: 0.2,
+            timeout_secs: 3600,
+            cpu_cores: 2.0,
+            memory_mb: 4096,
+            gpu_required: false,
+        });
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("challenge_started"));
+        assert!(json.contains("localhost:8080"));
+    }
+}

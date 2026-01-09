@@ -266,3 +266,78 @@ pub async fn get_snapshot(
         total_stake,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_now_returns_timestamp() {
+        let timestamp = now();
+        // Should be a reasonable Unix timestamp (after 2020)
+        assert!(timestamp > 1577836800); // Jan 1, 2020
+        // Should be less than far future (year 2100)
+        assert!(timestamp < 4102444800); // Jan 1, 2100
+    }
+
+    #[test]
+    fn test_now_increases() {
+        let t1 = now();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let t2 = now();
+        assert!(t2 >= t1);
+    }
+
+    #[test]
+    fn test_list_tasks_query_default_limit() {
+        let query = ListTasksQuery { limit: None };
+        assert_eq!(query.limit, None);
+    }
+
+    #[test]
+    fn test_list_tasks_query_with_limit() {
+        let query = ListTasksQuery { limit: Some(50) };
+        assert_eq!(query.limit, Some(50));
+    }
+
+    #[test]
+    fn test_snapshot_query_default_epoch() {
+        let query = SnapshotQuery { epoch: None };
+        assert_eq!(query.epoch, None);
+    }
+
+    #[test]
+    fn test_snapshot_query_with_epoch() {
+        let query = SnapshotQuery { epoch: Some(100) };
+        assert_eq!(query.epoch, Some(100));
+    }
+
+    #[test]
+    fn test_snapshot_response_serialization() {
+        let response = SnapshotResponse {
+            epoch: 10,
+            snapshot_time: 1234567890,
+            leaderboard: vec![],
+            validators: vec![],
+            total_stake: 1000,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"epoch\":10"));
+        assert!(json.contains("\"total_stake\":1000"));
+    }
+
+    #[test]
+    fn test_renew_request_deserialization() {
+        let json = r#"{
+            "validator_hotkey": "test_validator",
+            "signature": "test_sig",
+            "ttl_seconds": 300
+        }"#;
+
+        let request: RenewRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.validator_hotkey, "test_validator");
+        assert_eq!(request.signature, "test_sig");
+        assert_eq!(request.ttl_seconds, 300);
+    }
+}
