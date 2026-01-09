@@ -369,6 +369,41 @@ pub struct BanSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_subnet_config_load_success() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("subnet_config.json");
+
+        let mut config = SubnetConfig::default();
+        config.name = "Load Test".into();
+        config.max_validators = 42;
+        config.save(&path).unwrap();
+
+        let loaded = SubnetConfig::load(&path).unwrap();
+        let expected = serde_json::to_value(&config).unwrap();
+        let actual = serde_json::to_value(&loaded).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_subnet_config_validate_errors() {
+        let mut config = SubnetConfig::default();
+        config.epoch_length = 0;
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(msg) if msg.contains("epoch_length")));
+
+        let mut config = SubnetConfig::default();
+        config.max_validators = 0;
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(msg) if msg.contains("max_validators")));
+
+        let mut config = SubnetConfig::default();
+        config.weight_interval = 0;
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(msg) if msg.contains("weight_interval")));
+    }
 
     #[test]
     fn test_ban_list() {
@@ -406,5 +441,21 @@ mod tests {
     fn test_min_stake_constant() {
         // 1000 TAO = 1000 * 10^9 RAO
         assert_eq!(MIN_VALIDATOR_STAKE, 1_000_000_000_000);
+    }
+
+    #[test]
+    fn test_ban_list_load_from_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bans.json");
+        let hotkey = Hotkey([9u8; 32]);
+
+        {
+            let mut bans = BanList::new();
+            bans.ban_validator(&hotkey, "test", "sudo");
+            bans.save(&path).unwrap();
+        }
+
+        let loaded = BanList::load(&path).unwrap();
+        assert!(loaded.is_validator_banned(&hotkey));
     }
 }
