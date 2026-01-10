@@ -883,13 +883,26 @@ async fn handle_block_event(
                                 }
 
                                 if !uids.is_empty() {
+                                    // Max-upscale weights so largest = 65535
+                                    // This matches Python's convert_weights_and_uids_for_emit behavior
+                                    let max_val = *vals.iter().max().unwrap() as f64;
+                                    if max_val > 0.0 && max_val < 65535.0 {
+                                        vals = vals
+                                            .iter()
+                                            .map(|v| {
+                                                ((*v as f64 / max_val) * 65535.0).round() as u16
+                                            })
+                                            .collect();
+                                    }
+
                                     info!(
-                                        "Challenge {} (mech {}, emission_weight={:.2}): {} weights",
+                                        "Challenge {} (mech {}, emission_weight={:.2}): {} weights (max-upscaled)",
                                         challenge.id,
                                         challenge.mechanism_id,
                                         emission_weight,
                                         uids.len()
                                     );
+                                    debug!("  UIDs: {:?}, Weights: {:?}", uids, vals);
                                     weights.push((challenge.mechanism_id as u8, uids, vals));
                                 } else {
                                     warn!(
